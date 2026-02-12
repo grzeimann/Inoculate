@@ -9,12 +9,17 @@ These instructions follow the Panacea docs style: build a clean environment, ins
 git clone https://github.com/<your-org>/Inoculate.git
 cd Inoculate
 
-# Create and activate the environment
-conda create -y -n inoculate python=3.11
+# Create the environment from the YAML file and activate it
+conda env create -f environment.yml
 conda activate inoculate
 
-# Install package plus docs extras
-pip install -U .[docs]
+# (Optional) If environment.yml changes later, update with:
+# conda env update -f environment.yml --prune
+
+# Install package plus docs extras (if not managed via pip in environment.yml)
+# In this repo, docs/dev extras are already listed under pip: in environment.yml,
+# so this step is typically not needed. If you created the env manually, run:
+# pip install -U .[docs]
 ```
 
 ## Option B — venv (Python 3.10+)
