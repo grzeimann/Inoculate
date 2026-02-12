@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: If you use Inoculate, please cite it as below.
+title: Inoculate: Structured sky subtraction for VIRUS 3-dither exposures
+authors:
+  - name: Inoculate Developers
+version: 0.0.1
+date-released: 2026-02-12
+license: BSD-3-Clause
+keywords:
+  - astronomy
+  - sky subtraction
+  - IFU
+  - VIRUS
+  - HETDEX
+repository-code: https://github.com/<your-org>/Inoculate

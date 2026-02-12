@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Inoculate"
+version = "0.0.1"
+description = "Revisiting and improving sky subtraction for standard VIRUS 3-dither exposures"
+authors = [
+  { name = "Inoculate Developers" }
+]
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BSD-3-Clause" }
+keywords = ["astronomy", "sky subtraction", "IFU", "VIRUS", "HETDEX"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "ruff>=0.3",
+]
+docs = [
+  "sphinx>=7",
+  "myst-parser>=2",
+  "sphinx_rtd_theme>=2",
+  "linkify-it-py>=2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+pythonpath = ["src"]
+
