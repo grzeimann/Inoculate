@@ -10,7 +10,7 @@ authors = [
   { name = "Inoculate Developers" }
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "BSD-3-Clause" }
 keywords = ["astronomy", "sky subtraction", "IFU", "VIRUS", "HETDEX"]
 classifiers = [
@@ -19,6 +19,9 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = []
+
+[project.scripts]
+inoculate-shot = "inoculate.cli.inoculate_shot:main"
 
 [project.optional-dependencies]
 dev = [

@@ -9,9 +9,11 @@ This repository currently provides the foundational package and documentation sc
 Option A — Conda (recommended)
 
 ```bash
-conda create -y -n inoculate python=3.11
+# Create the environment from the YAML file
+conda env create -f environment.yml
 conda activate inoculate
-pip install -U .[docs]
+# (Optional) If the file changes later, update with:
+# conda env update -f environment.yml --prune
 ```
 
 Option B — venv (Python 3.10+)
