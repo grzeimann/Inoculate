@@ -85,8 +85,13 @@ def run_shot(
     out.mkdir(parents=True, exist_ok=True)
     ms = modelspec or ModelSpec()
 
+    # Centralized stage paths via ShotPlan
+    from .plan import ShotPlan
+    plan = ShotPlan(out)
+    paths = plan.paths()
+
     # Stage 00 — Info + schema validation
-    stage00 = out / "stage_00_info.json"
+    stage00 = paths["stage_00_info"]
     if not (resume and stage00.exists()):
         logger.info("[Stage 00] Info + schema validation")
         h5 = H5VIRUS(h5file)
@@ -105,7 +110,7 @@ def run_shot(
     wmask = _wave_mask(n_wave, ms.wave_mask_frac)
 
     # Stage 01 — Compute BW_amp
-    stage01 = out / "stage_01_bw_amp.npz"
+    stage01 = paths["stage_01_bw_amp"]
     if not (resume and stage01.exists()):
         logger.info("[Stage 01] Compute BW_amp")
         h5 = H5VIRUS(h5file)
@@ -115,7 +120,7 @@ def run_shot(
         bw_amp = _load_npz(stage01)["bw_amp"]
 
     # Stage 02 — Compute BW_full
-    stage02 = out / "stage_02_bw_full.npz"
+    stage02 = paths["stage_02_bw_full"]
     if not (resume and stage02.exists()):
         logger.info("[Stage 02] Compute BW_full")
         bw_full = compute_bw_full(bw_amp)
@@ -124,8 +129,8 @@ def run_shot(
         bw_full = _load_npz(stage02)["bw_full"]
 
     # Stage 03 — QC features + labeling (initialize LabelSet)
-    stage03 = out / "stage_03_amp_qc.parquet"
-    stage03_labels = out / "stage_03_labels.json"
+    stage03 = paths["stage_03_qc"]
+    stage03_labels = paths["stage_03_labels"]
     if not (resume and stage03.exists()):
         logger.info("[Stage 03] QC features + labeling")
         df_feat = compute_amp_features(bw_amp, bw_full, wmask)
@@ -150,8 +155,8 @@ def run_shot(
     good_mask = ls.good_mask()
 
     # Stage 04 — Build mult_scale
-    stage04 = out / "stage_04_mult.npz"
-    stage04_labels = out / "stage_04_labels.json"
+    stage04 = paths["stage_04_mult"]
+    stage04_labels = paths["stage_04_labels"]
     if not (resume and stage04.exists()):
         logger.info("[Stage 04] Build multiplicative mult_scale")
         mult = build_mult_scale(bw_amp, bw_full, good_mask, wmask, bounds=ms.mult_bounds)
@@ -164,8 +169,8 @@ def run_shot(
         save_labelset(stage04_labels, ls)
 
     # Stage 04.25 — Fit 2D polynomial model to mult vs. sky position (per exposure)
-    stage0425 = out / "stage_0425_mult_poly2d.npz"
-    stage0425_labels = out / "stage_0425_labels.json"
+    stage0425 = paths["stage_0425_mult_poly2d"]
+    stage0425_labels = paths["stage_0425_labels"]
     if not (resume and stage0425.exists()):
         logger.info("[Stage 04.25] Fit 2D polynomial to mult (per exposure)")
         h5 = H5VIRUS(h5file)
@@ -200,7 +205,7 @@ def run_shot(
                 save_labelset(stage0425_labels, ls)
 
     # Stage 04.5 — Fit shared additive polynomial per amp on residual_1
-    stage045 = out / "stage_045_poly.npz"
+    stage045 = paths["stage_045_poly"]
     if not (resume and stage045.exists()):
         logger.info("[Stage 04.5] Fit shared additive polynomial per amplifier")
         beta_all = build_amp_poly(
@@ -218,7 +223,7 @@ def run_shot(
         beta_all = _load_npz(stage045)["poly_beta"]
 
     # Stage 05 — Build PCA basis
-    stage05 = out / "stage_05_pca.npz"
+    stage05 = paths["stage_05_pca"]
     if not (resume and stage05.exists()):
         logger.info("[Stage 05] Build shot PCA basis")
         pca = build_shot_pca(
@@ -238,7 +243,7 @@ def run_shot(
         pca = _load_npz(stage05)
 
     # Stage 06 — Per-amp fits (use Stage 04.5 poly + per-exp PCA coeffs)
-    stage06 = out / "stage_06_amp_fits.parquet"
+    stage06 = paths["stage_06_amp_fits"]
     if not (resume and stage06.exists()):
         logger.info("[Stage 06] Fit amplifiers: shared poly + PCA coeffs")
         df_fits = _fit_all_amps(
@@ -255,7 +260,7 @@ def run_shot(
         write_parquet(df_fits, stage06)
 
     # Stage 07 — Manifest
-    stage07 = out / "stage_07_model_start_manifest.json"
+    stage07 = paths["stage_07_manifest"]
     if not (resume and stage07.exists()):
         logger.info("[Stage 07] Write model-start manifest")
         manifest = {

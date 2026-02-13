@@ -78,6 +78,14 @@ class LabelSet:
         return ls
 
     def update_with_mult(self, mult: np.ndarray, bounds: Tuple[float, float] | None = None) -> None:
+        """Update labels using multiplicative scale bounds.
+
+        Adds explicit numeric context to reasons so downstream inspection makes
+        decisions clear. Reasons include the observed value and configured
+        bounds, e.g., "mult_out_of_bounds[m=0.12,low=0.5,high=2]" and when far
+        outside the band (20% margin) an additional
+        "mult_far_outside[m=...,low=...,high=...,margin=...]" is recorded.
+        """
         if mult.size == 0 or self.n_amp == 0:
             return
         low, high = (bounds if bounds is not None else (0.2, 5.0))
@@ -91,11 +99,12 @@ class LabelSet:
                     continue
                 if m < low or m > high:
                     self.score[a, e] *= 0.25
-                    self._append_reason(a, e, "mult_out_of_bounds")
+                    self._append_reason(a, e, f"mult_out_of_bounds[m={m:.3g},low={low:.3g},high={high:.3g}]")
                     # mask only if far outside (20% beyond)
                     margin = 0.2 * (high - low)
                     if m < (low - margin) or m > (high + margin):
                         self.mask[a, e] = False
+                        self._append_reason(a, e, f"mult_far_outside[m={m:.3g},low={low:.3g},high={high:.3g},margin={margin:.3g}]")
         self._update_mask_from_score()
 
     def update_with_poly2d(self, mult: np.ndarray, pred: np.ndarray, rel_thresh: Tuple[float, float] = (3.0, 5.0)) -> None:
@@ -136,10 +145,10 @@ class LabelSet:
                 r = abs(m - p) / max(eps, scale)
                 if r > t_soft:
                     self.score[a, e] *= 0.8
-                    self._append_reason(a, e, "poly2d_resid>soft")
+                    self._append_reason(a, e, f"poly2d_resid>soft[r={r:.3g},t={t_soft:.3g},scale={scale:.3g}]")
                 if r > t_hard:
                     self.mask[a, e] = False
-                    self._append_reason(a, e, "poly2d_resid>hard")
+                    self._append_reason(a, e, f"poly2d_resid>hard[r={r:.3g},t={t_hard:.3g},scale={scale:.3g}]")
         self._update_mask_from_score()
 
     def per_amp_summary(self) -> pd.DataFrame:

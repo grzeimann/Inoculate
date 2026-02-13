@@ -35,16 +35,19 @@ def _load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 def _stage_paths(outdir: str | Path) -> Dict[str, Path]:
-    out = Path(outdir)
+    # Use centralized ShotPlan for path resolution, but keep legacy keys
+    from ..shot.plan import ShotPlan
+    plan = ShotPlan(Path(outdir))
+    sp = plan.paths()
     return {
-        "bw_amp": out / "stage_01_bw_amp.npz",
-        "bw_full": out / "stage_02_bw_full.npz",
-        "qc": out / "stage_03_amp_qc.parquet",
-        "mult": out / "stage_04_mult.npz",
-        "mult_poly2d": out / "stage_0425_mult_poly2d.npz",
-        "pca": out / "stage_05_pca.npz",
-        "fits": out / "stage_06_amp_fits.parquet",
-        "info": out / "stage_00_info.json",
+        "bw_amp": sp["stage_01_bw_amp"],
+        "bw_full": sp["stage_02_bw_full"],
+        "qc": sp["stage_03_qc"],
+        "mult": sp["stage_04_mult"],
+        "mult_poly2d": sp["stage_0425_mult_poly2d"],
+        "pca": sp["stage_05_pca"],
+        "fits": sp["stage_06_amp_fits"],
+        "info": sp["stage_00_info"],
     }
 
 
