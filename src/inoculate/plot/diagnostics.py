@@ -22,6 +22,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+# Optional: load iterative labels if available
+try:
+    from ..qc.labels import load_labelset
+except Exception:  # pragma: no cover - optional at runtime
+    load_labelset = None  # type: ignore[assignment]
+
 
 def _load_npz(path: Path) -> Dict[str, np.ndarray]:
     with np.load(path) as d:  # type: ignore[no-untyped-call]
@@ -269,6 +275,7 @@ def plot_mult_by_amp(
     highlight_outliers: bool = True,
     show_labels: bool = True,
     save: Optional[str | Path] = None,
+    save_labels_csv: Optional[str | Path] = None,
     show: bool = False,
 ) -> plt.Axes:
     """Summarize multiplicative scale by amplifier across exposures.
@@ -292,10 +299,32 @@ def plot_mult_by_amp(
 
     mult = _load_npz(paths["mult"])['mult_scale']  # (n_amp, n_exp)
     df_qc = pd.read_parquet(paths["qc"])  # columns: amp, exp, features, label merged in pipeline
-    # Build per-amp label (worst-case across exps)
-    labels = df_qc.groupby("amp")["label"].first() if "label" in df_qc.columns else pd.Series({i: "good" for i in range(mult.shape[0])})
 
+    # Try to load the latest iterative LabelSet snapshot for richer summaries
+    ls = None
+    labels_dir = Path(outdir)
+    candidates = [labels_dir / "stage_0425_labels.json", labels_dir / "stage_04_labels.json", labels_dir / "stage_03_labels.json"]
+    for c in candidates:
+        if c.exists() and load_labelset is not None:
+            try:
+                ls = load_labelset(c)
+                break
+            except Exception:
+                ls = None
+
+    # Determine per-amp good/bad mask and basic counts
     n_amp, n_exp = mult.shape
+    if ls is not None and getattr(ls, "n_amp", 0) == n_amp:
+        good_mask_amp = ls.good_mask().astype(bool)
+        overall_labels_series = pd.Series({i: ("good" if good_mask_amp[i] else "bad") for i in range(n_amp)})
+    else:
+        # Fallback to parquet label column if available
+        if "label" in df_qc.columns:
+            overall_labels_series = df_qc.groupby("amp")["label"].first().reindex(range(n_amp)).fillna("good")
+        else:
+            overall_labels_series = pd.Series({i: "good" for i in range(n_amp)})
+        good_mask_amp = (overall_labels_series.values == "good")
+
     colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
     markers = ["o", "s", "^", "D", "v", "P"]
 
@@ -314,8 +343,8 @@ def plot_mult_by_amp(
     for e in range(n_exp):
         x = xs + (dx[e] if e < len(dx) else 0.0)
         y = mult[:, e]
-        if highlight_outliers and "label" in df_qc.columns:
-            bad_mask = labels.reindex(range(n_amp)).fillna("good").values != "good"
+        if highlight_outliers:
+            bad_mask = ~good_mask_amp
             ax.scatter(x[~bad_mask], y[~bad_mask], c=colors[e % len(colors)], marker=markers[e % len(markers)], s=22, alpha=0.8, label=f"exp {e}")
             ax.scatter(x[bad_mask], y[bad_mask], facecolors="none", edgecolors="red", marker=markers[e % len(markers)], s=60, linewidths=1.0)
         else:
@@ -335,12 +364,78 @@ def plot_mult_by_amp(
         handles.append(Line2D([0], [0], color="red", marker="o", fillstyle="none", linestyle="None", label="non-good amp"))
     ax.legend(handles=handles, ncol=min(4, len(handles)))
 
-    if show_labels and "label" in df_qc.columns:
-        # Build a compact label summary at the bottom
-        counts = labels.value_counts().to_dict()
-        text = " | ".join([f"{k}: {v}" for k, v in counts.items()])
-        ax.text(0.01, -0.18, f"QC labels — {text}", transform=ax.transAxes, fontsize=9, va="top")
-        plt.subplots_adjust(bottom=0.22)
+    if show_labels:
+        # Build counts and an optional detailed table using LabelSet if available
+        counts = overall_labels_series.value_counts().to_dict()
+        counts_text = " | ".join([f"{k}: {v}" for k, v in counts.items()])
+        footer_lines: List[str] = [f"QC labels — {counts_text}"]
+
+        summary_df: Optional[pd.DataFrame] = None
+        if ls is not None and getattr(ls, "n_amp", 0) == n_amp:
+            # Construct per-amp summary
+            rows = []
+            for a in range(n_amp):
+                mask_row = ls.mask[a, :].astype(bool)
+                score_row = ls.score[a, :].astype(float)
+                reasons_row = [str(ls.reasons[a, e]) if ls.reasons[a, e] else "" for e in range(ls.n_exp)]
+                bad_exps_idx = [str(e) for e in range(ls.n_exp) if not mask_row[e]]
+                # Deduplicate reasons across exposures
+                reasons_tokens: List[str] = []
+                for r in reasons_row:
+                    if not r:
+                        continue
+                    for tok in r.split(","):
+                        tok = tok.strip()
+                        if tok and tok not in reasons_tokens:
+                            reasons_tokens.append(tok)
+                rows.append({
+                    "amp": int(a),
+                    "overall_label": ("good" if good_mask_amp[a] else "bad"),
+                    "min_score": float(np.nanmin(score_row) if score_row.size else np.nan),
+                    "n_bad_exp": int(np.sum(~mask_row)),
+                    "bad_exps": ",".join(bad_exps_idx),
+                    "reasons": ",".join(reasons_tokens),
+                })
+            summary_df = pd.DataFrame(rows).sort_values(["overall_label", "n_bad_exp", "min_score"], ascending=[True, False, True])
+
+            # Render a compact table for non-good amps (up to 12 rows)
+            bad_df = summary_df.loc[summary_df["overall_label"] != "good"]
+            show_df = bad_df.head(12) if not bad_df.empty else summary_df.head(8)
+            if not show_df.empty:
+                # Convert to text block to keep MPL lightweight
+                colnames = ["amp", "overall_label", "n_bad_exp", "bad_exps", "min_score", "reasons"]
+                show_cols = [c for c in colnames if c in show_df.columns]
+                lines = [" | ".join(map(str, show_cols))]
+                for _, r in show_df[show_cols].iterrows():
+                    lines.append(" | ".join(map(lambda v: f"{v}", r.tolist())))
+                text_block = "\n".join(lines)
+                footer_lines.append(text_block)
+                # Add some bottom margin for the text block
+                plt.subplots_adjust(bottom=0.32)
+            else:
+                plt.subplots_adjust(bottom=0.22)
+        else:
+            plt.subplots_adjust(bottom=0.22)
+
+        # Put the footer text
+        ax.text(0.01, -0.18, "\n".join(footer_lines), transform=ax.transAxes, fontsize=8, va="top", family="monospace")
+
+        # Optionally save CSV summary
+        try:
+            if save_labels_csv is None and save is not None:
+                # Derive CSV path next to image
+                save_labels_csv = Path(str(save)).with_suffix("")
+                save_labels_csv = Path(str(save_labels_csv) + "_label_summary.csv")
+            if save_labels_csv is not None:
+                p = Path(save_labels_csv)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                if 'summary_df' in locals() and isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+                    summary_df.to_csv(p, index=False)
+                else:
+                    # Fallback simple counts
+                    pd.DataFrame([counts]).to_csv(p, index=False)
+        except Exception:
+            pass
 
     if save is not None:
         Path(save).parent.mkdir(parents=True, exist_ok=True)

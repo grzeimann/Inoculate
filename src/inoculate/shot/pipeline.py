@@ -16,7 +16,7 @@ from ..io.h5 import H5VIRUS
 from ..io.write import write_parquet
 from ..model.base import ModelSpec
 from ..qc.features import compute_amp_features
-from ..qc.labels import label_amps
+from ..qc.labels import label_amps, LabelSet, save_labelset, load_labelset
 from ..robust import biweight_location
 from ..sky.mult.build import build_mult_scale
 from ..sky.mult import build_mult_poly2d
@@ -123,37 +123,49 @@ def run_shot(
     else:
         bw_full = _load_npz(stage02)["bw_full"]
 
-    # Stage 03 — QC features + labeling
+    # Stage 03 — QC features + labeling (initialize LabelSet)
     stage03 = out / "stage_03_amp_qc.parquet"
+    stage03_labels = out / "stage_03_labels.json"
     if not (resume and stage03.exists()):
         logger.info("[Stage 03] QC features + labeling")
         df_feat = compute_amp_features(bw_amp, bw_full, wmask)
-        # Derive labels and good mask for logging; store features only per spec
-        df_labels, good_mask_tmp = label_amps(df_feat)
+        # Derive labels (per-amp summary) for visibility in the parquet
+        df_labels, _good_mask_tmp = label_amps(df_feat)
         # Merge per-amp label back to rows for visibility
         df = df_feat.merge(df_labels, on="amp", how="left")
         write_parquet(df, stage03)
-    # For subsequent stages, derive good_mask from the parquet (works on resume too)
-    import pandas as pd  # local import to avoid mandatory dep if unused
-    df_qc = pd.read_parquet(stage03)
-    # Recompute conservative good_mask with same rules used in label_amps
-    med_mad = df_qc["mad_resid"].median() if np.isfinite(df_qc["mad_resid"]).any() else 0.0
-    good_mask = np.ones(n_amp, dtype=bool)
-    for a, g in df_qc.groupby("amp"):
-        if (g["zero_frac"] > 0.5).any() or (g["mad_resid"] > max(1e-6, 10.0 * med_mad)).any():
-            good_mask[int(a)] = False
+        # Initialize iterative LabelSet and save snapshot
+        ls = LabelSet.from_features(df_feat)
+        save_labelset(stage03_labels, ls)
+    else:
+        # On resume, build or load LabelSet from existing parquet
+        import pandas as pd  # local import to avoid mandatory dep if unused
+        df = pd.read_parquet(stage03)
+        if stage03_labels.exists():
+            ls = load_labelset(stage03_labels)
+        else:
+            ls = LabelSet.from_features(df)
+            save_labelset(stage03_labels, ls)
+    # Use LabelSet to derive conservative good_mask for subsequent stages
+    good_mask = ls.good_mask()
 
     # Stage 04 — Build mult_scale
     stage04 = out / "stage_04_mult.npz"
+    stage04_labels = out / "stage_04_labels.json"
     if not (resume and stage04.exists()):
         logger.info("[Stage 04] Build multiplicative mult_scale")
         mult = build_mult_scale(bw_amp, bw_full, good_mask, wmask, bounds=ms.mult_bounds)
         np.savez_compressed(stage04, mult_scale=mult)
     else:
         mult = _load_npz(stage04)["mult_scale"]
+    # Update labels with mult diagnostics and save snapshot (idempotent on resume)
+    if not stage04_labels.exists():
+        ls.update_with_mult(mult, bounds=ms.mult_bounds)
+        save_labelset(stage04_labels, ls)
 
     # Stage 04.25 — Fit 2D polynomial model to mult vs. sky position (per exposure)
     stage0425 = out / "stage_0425_mult_poly2d.npz"
+    stage0425_labels = out / "stage_0425_labels.json"
     if not (resume and stage0425.exists()):
         logger.info("[Stage 04.25] Fit 2D polynomial to mult (per exposure)")
         h5 = H5VIRUS(h5file)
@@ -175,8 +187,17 @@ def run_shot(
             y=poly2d.y,
             pred=poly2d.pred,
         )
+        # Update labels with poly2d residuals and save snapshot
+        ls.update_with_poly2d(mult, poly2d.pred)
+        if not stage0425_labels.exists():
+            save_labelset(stage0425_labels, ls)
     else:
-        _ = _load_npz(stage0425)  # ensure readable; content used only for plotting/QA
+        # On resume, if labels snapshot missing, load poly2d outputs and update
+        if not stage0425_labels.exists():
+            data0425 = _load_npz(stage0425)
+            if "pred" in data0425:
+                ls.update_with_poly2d(mult, data0425["pred"])
+                save_labelset(stage0425_labels, ls)
 
     # Stage 04.5 — Fit shared additive polynomial per amp on residual_1
     stage045 = out / "stage_045_poly.npz"
