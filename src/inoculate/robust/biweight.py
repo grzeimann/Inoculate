@@ -31,8 +31,9 @@ def mad(x: np.ndarray, axis: int | None = None, scale: float = 1.4826) -> np.nda
         Gaussian data (default 1.4826).
     """
     x = np.asanyarray(x)
-    med = np.nanmedian(x, axis=axis, keepdims=True)
-    mad_raw = np.nanmedian(np.abs(x - med), axis=axis)
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(x, axis=axis, keepdims=True)
+        mad_raw = np.nanmedian(np.abs(x - med), axis=axis)
     return scale * mad_raw
 
 
@@ -43,7 +44,8 @@ def biweight_location(x: np.ndarray, axis: int | None = None) -> np.ndarray:
     """
     if _astro_biweight_location is not None:  # pragma: no cover - depends on env
         return _astro_biweight_location(x, axis=axis)
-    return np.nanmedian(np.asanyarray(x), axis=axis)
+    with np.errstate(all="ignore"):
+        return np.nanmedian(np.asanyarray(x), axis=axis)
 
 
 def biweight_scale(x: np.ndarray, axis: int | None = None) -> np.ndarray:

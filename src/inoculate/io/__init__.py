@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = [
     "amp_exposure_slice",
     "open_h5",
+    "H5VIRUS",
 ]
 
-from .h5 import amp_exposure_slice, open_h5  # re-export
+from .h5 import H5VIRUS, amp_exposure_slice, open_h5  # re-export
