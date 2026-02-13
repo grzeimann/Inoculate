@@ -22,7 +22,7 @@ class Poly2DResult:
     """Result of the 2D polynomial fit.
 
     Attributes:
-        degree: Polynomial degree used (currently supports 1 or 2).
+        degree: Polynomial degree used (non-negative integer).
         coeffs: Coefficients per exposure with shape (n_exp, n_terms).
         ra_amp: RA biweight per (amp, exp) in degrees, shape (n_amp, n_exp).
         dec_amp: Dec biweight per (amp, exp) in degrees, shape (n_amp, n_exp).
@@ -44,24 +44,45 @@ class Poly2DResult:
 def _design_matrix_xy(x: np.ndarray, y: np.ndarray, degree: int) -> Tuple[np.ndarray, list[str]]:
     """Build a 2D polynomial design matrix for coordinates (x, y).
 
+    Generates all monomials x^i y^j such that i + j <= degree, ordered by total
+    degree (0, 1, 2, ...), and within each degree in descending x-power
+    (graded lexicographic: x^d, x^{d-1}y, ..., y^d).
+
     Args:
         x: Array of x coordinates (any shape). Interpreted element-wise.
         y: Array of y coordinates with the same shape as ``x``.
-        degree: Polynomial degree (1 or 2).
+        degree: Non-negative polynomial degree (0, 1, 2, ...).
 
     Returns:
         Tuple (A, names) where A has shape (x.size, n_terms) and names lists the
         column names in order.
     """
-    if degree not in (1, 2):
-        raise ValueError("degree must be 1 or 2 for the 2D polynomial model")
+    if int(degree) != degree or degree < 0 or degree > 10:
+        raise ValueError("degree must be a non-negative integer < 11 for the 2D polynomial model")
+    d = int(degree)
     x1 = np.asarray(x, dtype=float).ravel()
     y1 = np.asarray(y, dtype=float).ravel()
-    cols = [np.ones_like(x1), x1, y1]
-    names = ["1", "x", "y"]
-    if degree >= 2:
-        cols += [x1 * x1, x1 * y1, y1 * y1]
-        names += ["x2", "xy", "y2"]
+
+    cols: list[np.ndarray] = []
+    names: list[str] = []
+    # Degree 0 term
+    cols.append(np.ones_like(x1))
+    names.append("1")
+    # Higher degree terms
+    for total in range(1, d + 1):
+        for i in range(total, -1, -1):  # i = total..0, j = total - i
+            j = total - i
+            term = (x1 ** i) * (y1 ** j)
+            cols.append(term)
+            if i == 0 and j == 0:
+                names.append("1")
+            elif i == 0:
+                names.append(f"y{j}")
+            elif j == 0:
+                names.append(f"x{i}")
+            else:
+                names.append(f"x{i}y{j}")
+
     A = np.vstack(cols).T  # (N, n_terms)
     return A, names
 
@@ -83,7 +104,7 @@ def build_mult_poly2d(
     Args:
         h5: Open VIRUS reader for the shot file.
         mult: Array of multiplicative scales with shape (n_amp, n_exp).
-        degree: Polynomial degree (1 or 2). Default is 2.
+        degree: Polynomial degree (non-negative integer). Default is 2.
         loss: Robust loss to use in the IRLS solver ("huber" or "tukey").
         huber_delta: Huber tuning constant.
         tukey_c: Tukey tuning constant.
@@ -125,7 +146,9 @@ def build_mult_poly2d(
     y = (dec_amp - dec_mean) * 60.0  # arcmin
 
     # Prepare outputs
-    n_terms = 3 if degree == 1 else 6
+    if int(degree) != degree or degree < 0:
+        raise ValueError("degree must be a non-negative integer")
+    n_terms = (int(degree) + 1) * (int(degree) + 2) // 2
     coeffs = np.zeros((n_exp, n_terms), dtype=float)
     pred = np.full_like(mult, np.nan, dtype=float)
 

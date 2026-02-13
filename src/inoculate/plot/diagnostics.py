@@ -322,7 +322,7 @@ def plot_mult_by_amp(
             ax.scatter(x, y, c=colors[e % len(colors)], marker=markers[e % len(markers)], s=22, alpha=0.8, label=f"exp {e}")
         # Overlay model as a line across amp index ordering
         if pred is not None:
-            ax.plot(xs, pred[:, e], color=colors[e % len(colors)], lw=1.2, ls='--', alpha=0.9)
+            ax.plot(xs, pred[:, e], color=colors[e % len(colors)], lw=3.2, ls='-', alpha=0.7)
 
     ax.set_xlabel("amplifier index")
     ax.set_ylabel("multiplicative scale (mult)")

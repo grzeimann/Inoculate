@@ -160,7 +160,7 @@ def run_shot(
         poly2d = build_mult_poly2d(
             h5,
             mult,
-            degree=2,
+            degree=3,
             loss=ms.robust_loss,
             huber_delta=ms.huber_delta,
             tukey_c=ms.tukey_c,
