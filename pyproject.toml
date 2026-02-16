@@ -23,6 +23,7 @@ dependencies = []
 [project.scripts]
 inoculate-shot = "inoculate.cli.inoculate_shot:main"
 inoculate-ifu = "inoculate.cli.inoculate_ifu:main"
+inoculate-survey = "inoculate.cli.inoculate_survey:main"
 
 [project.optional-dependencies]
 dev = [

@@ -1,19 +1,49 @@
 """IFU (fiber-level) refinement pipeline.
 
-Builds per-fiber multiplicative tweaks (delta_mult) and source masks by
-consuming shot-level artifacts. Outputs compact NPZ files per amplifier and
-exposure, grouped under outdir/ifu/.
+Mathematical intent
+-------------------
+Given shot-level references built by the SingleShot pipeline,
+  - BW_amp[a,e,w] is the robust per-amplifier spectrum (biweight across 112 fibers),
+  - BW_full[e,w] is the robust per-exposure sky spectrum (biweight across amps),
+  - mult[a,e] is the per-(amp,exp) multiplicative scale from Stage "Fit_Multiplicative_Scale",
+  - m̂[a,e] is the 2D polynomial field prediction of mult vs. (x,y), from Stage
+    "Fit_Poly2D_Field_Model" (if computed). Its NPZ artifact stores key "pred"
+    with shape (n_amp, n_exp).
 
-This is a minimal implementation intended to match the Junie instructions:
-- ZERO amps remain zero; we skip computations and record the invariant.
-- Non-good amps (per labels) are treated as DEFECTIVE: we record minimal model
-  usage and compute diagnostics but do not apply refined corrections.
-- GOOD amps: compute per-fiber provisional delta_mult against BW_full using a
-  robust wavelength window; then identify likely source-affected fibers using a
-  MAD threshold across fibers within an amp/exposure.
+For the IFU step we measure a per-fiber refinement factor delta_mult[f] without
+fitting any new model yet. For each (amp=a, exp=e):
+  1) Form total flux per fiber: Y[f,w] = spectrum[f,w] + skyspectrum[f,w].
+  2) Build a central-fraction wavelength mask W based on wave_mask_frac.
+  3) Choose the multiplicative baseline for this (a,e):
+       base = m̂[a,e] if the Poly2D prediction exists, otherwise base = mult[a,e].
+  4) Define the exposure reference spectrum on the mask:
+       ref[w in W] = BW_full[e,w] * base.
+  5) For each fiber f, estimate
+       delta_mult[f] = biweight_location( Y[f,W] / ref[W] ).
+  6) Across fibers in the amp, detect sources using a MAD-based threshold on
+     delta_mult; replace outliers by the median to keep the vector finite.
 
-The pipeline reads only what it needs from the HDF5 using H5VIRUS.iter_amp_blocks
-and the /Info table for IFU slot annotations.
+This produces a 112-length vector per (amp,exp). We also concatenate four
+consecutive amps into a per-IFU vector of length 448 per exposure.
+
+Operational decisions
+---------------------
+- ZERO amps: outputs are all zeros and no computation is performed.
+- DEFECTIVE_OR_BRIGHT amps: we compute diagnostics but recommend a minimal model
+  (avoid overfitting); notes are recorded in the NPZ.
+- GOOD amps: full delta_mult computation + source masking is applied.
+
+Artifacts
+---------
+- Per amp/exp: outdir/ifu/aAA_eEE_fiber_model.npz with keys {delta_mult, source_mask, ...}
+- Per IFU/exp: outdir/ifu/ifuIII_eEE_fiber_model.npz (448 fibers).
+- Optional diagnostics: outdir/ifu/plots/ifuIII_delta_mult.png (one line per exposure).
+
+Implementation notes
+--------------------
+The baseline used for delta_mult always prefers the Poly2D prediction m̂ (when
+present), falling back to mult. This ensures IFU refinement measures residual
+structure relative to the same mult(2D poly) model used by the shot pipeline.
 """
 from __future__ import annotations
 
@@ -22,10 +52,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
+import logging
 
 from ..io.h5 import H5VIRUS, amp_exposure_slice
 from ..qc.labels import load_labelset
 from ..robust import biweight_location, mad
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -100,14 +133,24 @@ def _load_shot_artifacts(outdir: Path) -> Dict[str, np.ndarray]:
         p_bw_amp = sp.get("Build_Amplifier_Robust_Spectra") or sp.get("stage_01_bw_amp")
         p_bw_full = sp.get("Build_Full_Exposure_Sky") or sp.get("stage_02_bw_full")
         p_mult = sp.get("Fit_Multiplicative_Scale") or sp.get("stage_04_mult")
+        p_poly2d = sp.get("Fit_Poly2D_Field_Model") or sp.get("stage_0425_mult_poly2d")
     except Exception:
         p_bw_amp = outdir / "stage_01_bw_amp.npz"
         p_bw_full = outdir / "stage_02_bw_full.npz"
         p_mult = outdir / "stage_04_mult.npz"
+        p_poly2d = outdir / "stage_0425_mult_poly2d.npz"
 
     bw_amp = _load_npz(p_bw_amp).get("bw_amp") if p_bw_amp and p_bw_amp.exists() else None
     bw_full = _load_npz(p_bw_full).get("bw_full") if p_bw_full and p_bw_full.exists() else None
     mult = _load_npz(p_mult).get("mult_scale") if p_mult and p_mult.exists() else None
+    mult_pred = None
+    if p_poly2d and p_poly2d.exists():
+        try:
+            poly2d_npz = _load_npz(p_poly2d)
+            if "pred" in poly2d_npz:
+                mult_pred = poly2d_npz["pred"]
+        except Exception:
+            mult_pred = None
     if bw_amp is None or bw_full is None or mult is None:
         raise FileNotFoundError("Required shot artifacts (bw_amp, bw_full, mult) are missing in outdir")
     artifacts: Dict[str, np.ndarray] = {
@@ -115,7 +158,8 @@ def _load_shot_artifacts(outdir: Path) -> Dict[str, np.ndarray]:
         "bw_full": bw_full,
         "mult": mult,
     }
-    # Optional poly2d predictions and PCA could be added later if needed
+    if mult_pred is not None:
+        artifacts["mult_pred"] = mult_pred
     return artifacts
 
 
@@ -154,6 +198,292 @@ def _read_zero_frac_table(outdir: Path) -> Optional[np.ndarray]:
         return None
 
 
+# ---- Minimal IFU Stage abstraction (Phase B mirror) ----
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class _IFUContext:
+    h5file: str | Path
+    outdir: Path
+    plan: Any
+    opts: IFUOptions
+    # ephemeral/state
+    artifacts: Dict[str, np.ndarray] | None = None
+    wmask: np.ndarray | None = None
+    labels: Any | None = None
+    zero_table: Optional[np.ndarray] = None
+    info: Dict[str, Any] | None = None
+    n_written: int = 0
+    n_skipped: int = 0
+    ifu_written: int = 0
+    plots_written: int = 0
+
+
+class _IFUStage:
+    key: str = ""
+
+    def should_run(self, ctx: _IFUContext, resume: bool) -> bool:
+        # IFU stages are fast; keep simple resume semantics per stage
+        return True if not resume else True
+
+    def run(self, ctx: _IFUContext) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+def _execute_ifu_stages(stages: list[_IFUStage], ctx: _IFUContext, *, resume: bool = True) -> None:
+    for st in stages:
+        try:
+            if st.should_run(ctx, resume):
+                logger.info("[%s] start", st.key or st.__class__.__name__)
+                st.run(ctx)
+            else:
+                logger.info("[%s] resume: skipping", st.key or st.__class__.__name__)
+        except Exception:
+            logger.exception("IFU stage failed: %s", st.key or st.__class__.__name__)
+            raise
+
+
+class _IFUStageCompute(_IFUStage):
+    key = "IFU_Compute_PerAmp_Fiber_Model"
+
+    def run(self, ctx: _IFUContext) -> None:
+        from .plan import IFUPlan
+        ifu_plan = ctx.plan
+        out = ctx.outdir
+        artifacts = ctx.artifacts or _load_shot_artifacts(out)
+        ctx.artifacts = artifacts
+        bw_full = artifacts["bw_full"]
+        n_exp, n_wave = int(bw_full.shape[0]), int(bw_full.shape[1])
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(n_wave, ctx.opts.wave_mask_frac)
+        ctx.wmask = wmask
+        ls = ctx.labels if ctx.labels is not None else _latest_labelset(out)
+        ctx.labels = ls
+        zero_table = ctx.zero_table if ctx.zero_table is not None else _read_zero_frac_table(out)
+        ctx.zero_table = zero_table
+
+        h5 = H5VIRUS(ctx.h5file)
+        info = h5.read_info()
+        ctx.info = info
+        n_amp = int(info["n_amp"])  # type: ignore[arg-type]
+        exposures = int(info["exposures"])  # type: ignore[arg-type]
+        fibers_per_amp = int(info["fibers_per_amp"])  # type: ignore[arg-type]
+
+        ifu_indices: Optional[Iterable[int]] = getattr(ctx, "ifu_indices", None)  # may be attached by run_ifu
+        if ifu_indices is None:
+            amps_to_do = set(range(n_amp))
+        else:
+            amps_to_do = {int(i) for i in ifu_indices}
+
+        def _ifuslot_for_slice_start(row_index: int) -> str:
+            try:
+                h5._require_tables()
+                with h5._open() as fh:  # type: ignore[attr-defined]
+                    t = fh.root.Info
+                    raw = t.cols.ifuslot[row_index]
+                    if isinstance(raw, (bytes, bytearray)):
+                        return raw.decode("utf-8", errors="ignore")
+                    return str(raw)
+            except Exception:
+                return f"amp{row_index // fibers_per_amp // exposures:02d}"
+
+        for a, e, s, arrays in h5.iter_amp_blocks(["spectrum", "skyspectrum"]):
+            if a not in amps_to_do:
+                continue
+            if e < 0 or e >= n_exp:
+                continue
+            save_path = ifu_plan.fiber_model_path(a, e)
+            if getattr(ctx, "resume", True) and save_path.exists():
+                ctx.n_skipped += 1
+                continue
+
+            spec = arrays["spectrum"].astype(float)
+            sky = arrays["skyspectrum"].astype(float)
+            Y = spec + sky
+            if Y.shape[0] != fibers_per_amp or Y.shape[1] != n_wave:
+                ctx.n_skipped += 1
+                continue
+
+            zf = float(zero_table[a, e]) if (zero_table is not None and np.isfinite(zero_table[a, e])) else None
+            label = _amp_label(ls, a, e, zf)
+
+            if label == "ZERO":
+                delta_mult = np.zeros(fibers_per_amp, dtype=float)
+                source_mask = np.zeros(fibers_per_amp, dtype=bool)
+                notes = "ZERO amp: outputs left at zero; no computation performed"
+            else:
+                # Use the best available multiplicative baseline for normalization:
+                # prefer the 2D poly field prediction if present; else use raw mult.
+                base_mult_all = artifacts.get("mult_pred", artifacts["mult"])  # shape (n_amp, n_exp)
+                base = float(base_mult_all[a, e]) if np.isfinite(base_mult_all[a, e]) else np.nan
+                ref = bw_full[e, wmask] * base
+                with np.errstate(all="ignore"):
+                    ratio = Y[:, wmask] / np.where(np.abs(ref) > 0, ref, np.nan)
+                delta_mult = np.full(fibers_per_amp, np.nan, dtype=float)
+                for f in range(fibers_per_amp):
+                    r = ratio[f]
+                    if np.isfinite(r).any():
+                        try:
+                            delta_mult[f] = float(biweight_location(r, axis=0))
+                        except Exception:
+                            delta_mult[f] = float(np.nanmedian(r))
+                    else:
+                        delta_mult[f] = np.nan
+                finite = np.isfinite(delta_mult)
+                if not np.any(finite):
+                    source_mask = np.zeros(fibers_per_amp, dtype=bool)
+                    delta_mult = np.ones(fibers_per_amp, dtype=float)
+                else:
+                    med = float(np.nanmedian(delta_mult[finite]))
+                    try:
+                        scale = float(1.4826 * mad(delta_mult[finite]))
+                    except Exception:
+                        scale = float(1.4826 * np.nanmedian(np.abs(delta_mult[finite] - med)))
+                    thr = max(1e-12, ctx.opts.k_source * (scale if np.isfinite(scale) and scale > 0 else 0.0))
+                    source_mask = np.zeros(fibers_per_amp, dtype=bool)
+                    if np.isfinite(med) and thr > 0:
+                        source_mask = np.abs(delta_mult - med) > thr
+                    delta_mult = np.where(source_mask, med, delta_mult)
+                    delta_mult = np.where(np.isfinite(delta_mult), delta_mult, 1.0)
+                if label == "DEFECTIVE_OR_BRIGHT":
+                    notes = ("DEFECTIVE_OR_BRIGHT amp: minimal model recommended; "
+                             "fiber-level deltas provided for diagnostics only")
+                else:
+                    notes = "GOOD amp: fiber-level deltas computed with source masking (baseline=poly2d if available)"
+
+            ifuslot = _ifuslot_for_slice_start(int(s.start))
+            np.savez_compressed(
+                save_path,
+                ifuslot=np.array(ifuslot),
+                amp=np.array(a, dtype=np.int16),
+                exp=np.array(e, dtype=np.int16),
+                delta_mult=delta_mult.astype(np.float32),
+                source_mask=source_mask.astype(np.bool_),
+                amp_label=np.array(label),
+                notes=np.array(notes),
+            )
+            ctx.n_written += 1
+
+
+class _IFUStageAggregate(_IFUStage):
+    key = "IFU_Aggregate_PerIFU"
+
+    def run(self, ctx: _IFUContext) -> None:
+        from .plan import IFUPlan
+        ifu_plan = ctx.plan
+        info = ctx.info or H5VIRUS(ctx.h5file).read_info()
+        n_amp = int(info["n_amp"])  # type: ignore[arg-type]
+        n_exp = int(info["exposures"])  # type: ignore[arg-type]
+        fibers_per_amp = int(info["fibers_per_amp"])  # type: ignore[arg-type]
+        n_ifu = (n_amp + 3) // 4
+
+        def _load_amp_npz(a_idx: int, e_idx: int) -> Optional[dict]:
+            p = ifu_plan.fiber_model_path(a_idx, e_idx)
+            if not p.exists():
+                return None
+            try:
+                with np.load(p) as d:  # type: ignore[no-untyped-call]
+                    return {k: d[k] for k in d.files}
+            except Exception:
+                return None
+
+        for ifu_idx in range(n_ifu):
+            for e_idx in range(n_exp):
+                parts_delta: list[np.ndarray] = []
+                parts_mask: list[np.ndarray] = []
+                amp_labels: list[str] = []
+                amp_ifuslots: list[str] = []
+                notes_list: list[str] = []
+                complete = True
+                for k in range(4):
+                    a_idx = ifu_idx * 4 + k
+                    if a_idx >= n_amp:
+                        complete = False
+                        break
+                    data = _load_amp_npz(a_idx, e_idx)
+                    if data is None:
+                        complete = False
+                        break
+                    dm = np.array(data.get("delta_mult", np.full((fibers_per_amp,), np.nan)), dtype=float)
+                    sm = np.array(data.get("source_mask", np.zeros((fibers_per_amp,), dtype=bool)), dtype=bool)
+                    parts_delta.append(dm)
+                    parts_mask.append(sm)
+                    amp_labels.append(str(np.array(data.get("amp_label", ""))))
+                    amp_ifuslots.append(str(np.array(data.get("ifuslot", f"a{a_idx:02d}"))))
+                    notes_list.append(str(np.array(data.get("notes", ""))))
+                if not complete:
+                    continue
+                delta_448 = np.concatenate(parts_delta, axis=0).astype(np.float32)
+                mask_448 = np.concatenate(parts_mask, axis=0).astype(np.bool_)
+                save_ifu = ifu_plan.ifu_model_path(ifu_idx, e_idx)
+                np.savez_compressed(
+                    save_ifu,
+                    ifu=np.array(ifu_idx, dtype=np.int16),
+                    exp=np.array(e_idx, dtype=np.int16),
+                    delta_mult=delta_448,
+                    source_mask=mask_448,
+                    amp_labels=np.array(amp_labels),
+                    amp_ifuslots=np.array(amp_ifuslots),
+                    notes=np.array(" | ".join([n for n in notes_list if n])),
+                )
+                ctx.ifu_written += 1
+
+
+class _IFUStagePlots(_IFUStage):
+    key = "IFU_Write_PerIFU_Plots"
+
+    def run(self, ctx: _IFUContext) -> None:
+        if not ctx.opts.make_plots or ctx.opts.max_plots <= 0:
+            return
+        from .plan import IFUPlan
+        ifu_plan = ctx.plan
+        info = ctx.info or H5VIRUS(ctx.h5file).read_info()
+        n_amp = int(info["n_amp"])  # type: ignore[arg-type]
+        n_exp = int(info["exposures"])  # type: ignore[arg-type]
+        fibers_per_amp = int(info["fibers_per_amp"])  # type: ignore[arg-type]
+        n_ifu = (n_amp + 3) // 4
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except Exception:
+            return
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+        plots_written = 0
+        for ifu_idx in range(n_ifu):
+            if plots_written >= int(ctx.opts.max_plots):
+                break
+            try:
+                plot_path = ifu_plan.ifu_plot_path(ifu_idx)
+                plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig, ax = plt.subplots(figsize=(10, 3.2))
+                x = np.arange(fibers_per_amp * 4)
+                have_any = False
+                for e_idx in range(n_exp):
+                    p = ifu_plan.ifu_model_path(ifu_idx, e_idx)
+                    if not p.exists():
+                        continue
+                    with np.load(p) as d:  # type: ignore[no-untyped-call]
+                        y = np.array(d.get("delta_mult", np.full((fibers_per_amp*4,), np.nan)), dtype=float)
+                        m = np.array(d.get("source_mask", np.zeros((fibers_per_amp*4,), dtype=bool)), dtype=bool)
+                    if not np.isfinite(y).any():
+                        continue
+                    have_any = True
+                    ax.plot(x, y, color=colors[e_idx % len(colors)], lw=1.2, alpha=0.9, label=f"exp {e_idx}")
+                    if np.any(m):
+                        ax.scatter(x[m], y[m], facecolors="none", edgecolors=colors[e_idx % len(colors)], s=12, linewidths=0.8, alpha=0.7)
+                ax.set_title(f"IFU {ifu_idx:03d} — delta_mult per fiber (lines per exposure)")
+                ax.set_xlabel("fiber index (4 amps × 112)")
+                ax.set_ylabel("delta_mult")
+                ax.grid(True, alpha=0.2)
+                if have_any:
+                    ax.legend(loc="upper right", fontsize=8, ncol=min(4, n_exp))
+                fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                plots_written += 1
+            except Exception:
+                continue
+        ctx.plots_written += plots_written
+
+
 def run_ifu(
     h5file: str | Path,
     outdir: str | Path,
@@ -178,265 +508,32 @@ def run_ifu(
     from .plan import IFUPlan
     ifu_plan = IFUPlan(out)
     ifu_plan.ensure_dirs()
-    ifu_out = ifu_plan.ifu_dir
     opts = options or IFUOptions()
 
-    # Load artifacts and labels
-    artifacts = _load_shot_artifacts(out)
-    bw_full = artifacts["bw_full"]  # (n_exp, n_wave)
-    bw_amp = artifacts["bw_amp"]    # (n_amp, n_exp, n_wave)
-    n_exp, n_wave = int(bw_full.shape[0]), int(bw_full.shape[1])
-    wmask = _wave_mask(n_wave, opts.wave_mask_frac)
-    ls = _latest_labelset(out)
-    zero_table = _read_zero_frac_table(out)
+    # Build context and execute stages
+    ctx = _IFUContext(h5file=str(h5file), outdir=out, plan=ifu_plan, opts=opts)
+    # attach extra knobs for resume and selection
+    setattr(ctx, "resume", bool(resume))
+    if ifu_indices is not None:
+        setattr(ctx, "ifu_indices", list(ifu_indices))
 
-    # HDF5 iteration
-    h5 = H5VIRUS(h5file)
-    info = h5.read_info()
-    n_amp = int(info["n_amp"])  # type: ignore[arg-type]
-    exposures = int(info["exposures"])  # type: ignore[arg-type]
-    fibers_per_amp = int(info["fibers_per_amp"])  # type: ignore[arg-type]
+    stages: list[_IFUStage] = [
+        _IFUStageCompute(),
+        _IFUStageAggregate(),
+        _IFUStagePlots(),
+    ]
+    _execute_ifu_stages(stages, ctx, resume=resume)
 
-    if ifu_indices is None:
-        amps_to_do = set(range(n_amp))
-    else:
-        amps_to_do = {int(i) for i in ifu_indices}
-
-    # Helper to read IFU slot label for a given slice start
-    def _ifuslot_for_slice_start(row_index: int) -> str:
-        try:
-            h5._require_tables()
-            with h5._open() as fh:  # type: ignore[attr-defined]
-                t = fh.root.Info
-                raw = t.cols.ifuslot[row_index]
-                if isinstance(raw, (bytes, bytearray)):
-                    return raw.decode("utf-8", errors="ignore")
-                return str(raw)
-        except Exception:
-            return f"amp{row_index // fibers_per_amp // exposures:02d}"
-
-    n_written = 0
-    n_skipped = 0
-    plots_written = 0
-
-    for a, e, s, arrays in h5.iter_amp_blocks(["spectrum", "skyspectrum"]):
-        if a not in amps_to_do:
-            continue
-        # Only proceed if exposure matches our expectations
-        if e < 0 or e >= n_exp:
-            continue
-        save_path = ifu_plan.fiber_model_path(a, e)
-        if resume and save_path.exists():
-            n_skipped += 1
-            continue
-
-        # Construct total flux per fiber: spectrum + skyspectrum
-        spec = arrays["spectrum"].astype(float)
-        sky = arrays["skyspectrum"].astype(float)
-        Y = spec + sky  # (fibers_per_amp, n_wave)
-        if Y.shape[0] != fibers_per_amp or Y.shape[1] != n_wave:
-            # shape mismatch; skip gracefully
-            n_skipped += 1
-            continue
-
-        # Determine amp label (ZERO/DEFECTIVE/GOOD)
-        zf = float(zero_table[a, e]) if (zero_table is not None and np.isfinite(zero_table[a, e])) else None
-        label = _amp_label(ls, a, e, zf)
-
-        # ZERO invariant: leave outputs as zeros and continue
-        if label == "ZERO":
-            delta_mult = np.zeros(fibers_per_amp, dtype=float)
-            source_mask = np.zeros(fibers_per_amp, dtype=bool)
-            notes = "ZERO amp: outputs left at zero; no computation performed"
-        else:
-            # Provisional per-fiber delta_mult via robust ratio to the amp's expected sky
-            # Use exposure-level baseline scaled by the amp's multiplicative factor to avoid
-            # trivial self-division that can collapse to ones.
-            mult = artifacts["mult"][a, e]
-            ref = bw_full[e, wmask] * (mult if np.isfinite(mult) else np.nan)
-            with np.errstate(all="ignore"):
-                ratio = Y[:, wmask] / np.where(np.abs(ref) > 0, ref, np.nan)
-            # Use biweight location across wavelength per fiber; fallback to nanmedian if needed
-            delta_mult = np.full(fibers_per_amp, np.nan, dtype=float)
-            for f in range(fibers_per_amp):
-                r = ratio[f]
-                if np.isfinite(r).any():
-                    try:
-                        delta_mult[f] = float(biweight_location(r, axis=0))
-                    except Exception:
-                        delta_mult[f] = float(np.nanmedian(r))
-                else:
-                    delta_mult[f] = np.nan
-
-            # Source masking across fibers within this amp/exp using MAD
-            finite = np.isfinite(delta_mult)
-            if not np.any(finite):
-                med = np.nan
-                scale = np.nan
-                source_mask = np.zeros(fibers_per_amp, dtype=bool)
-                # No finite per-fiber estimates; fall back to unity so plots are not blank
-                delta_mult = np.ones(fibers_per_amp, dtype=float)
-            else:
-                med = float(np.nanmedian(delta_mult[finite]))
-                try:
-                    scale = float(1.4826 * mad(delta_mult[finite]))
-                except Exception:
-                    # fallback MAD
-                    scale = float(1.4826 * np.nanmedian(np.abs(delta_mult[finite] - med)))
-                thr = max(1e-12, opts.k_source * (scale if np.isfinite(scale) and scale > 0 else 0.0))
-                source_mask = np.zeros(fibers_per_amp, dtype=bool)
-                if np.isfinite(med) and thr > 0:
-                    source_mask = np.abs(delta_mult - med) > thr
-                # Replace outlier deltas with median to avoid contaminating downstream application
-                delta_mult = np.where(source_mask, med, delta_mult)
-                # Ensure finite
-                delta_mult = np.where(np.isfinite(delta_mult), delta_mult, 1.0)
-
-            if label == "DEFECTIVE_OR_BRIGHT":
-                notes = (
-                    "DEFECTIVE_OR_BRIGHT amp: minimal model recommended; "
-                    "fiber-level deltas provided for diagnostics only"
-                )
-            else:
-                notes = "GOOD amp: fiber-level deltas computed with source masking"
-
-        # Annotate IFU slot (best-effort)
-        ifuslot = _ifuslot_for_slice_start(int(s.start))
-
-        # Persist compact output
-        np.savez_compressed(
-            save_path,
-            ifuslot=np.array(ifuslot),
-            amp=np.array(a, dtype=np.int16),
-            exp=np.array(e, dtype=np.int16),
-            delta_mult=delta_mult.astype(np.float32),
-            source_mask=source_mask.astype(np.bool_),
-            amp_label=np.array(label),
-            notes=np.array(notes),
-        )
-        n_written += 1
-
-    # Aggregate per-IFU (4 amps per IFU) outputs into 448-length vectors per exposure
-    # We will load any missing per-amp results from disk (e.g., when --resume skipped computation).
-    def _load_amp_npz(a_idx: int, e_idx: int) -> Optional[dict]:
-        p = ifu_plan.fiber_model_path(a_idx, e_idx)
-        if not p.exists():
-            return None
-        try:
-            with np.load(p) as d:  # type: ignore[no-untyped-call]
-                return {k: d[k] for k in d.files}
-        except Exception:
-            return None
-
-    ifu_written = 0
-    n_ifu = (n_amp + 3) // 4  # assume 4 amps per IFU in order
-    for ifu_idx in range(n_ifu):
-        for e_idx in range(n_exp):
-            # collect four amps for this IFU
-            parts_delta: list[np.ndarray] = []
-            parts_mask: list[np.ndarray] = []
-            amp_labels: list[str] = []
-            amp_ifuslots: list[str] = []
-            notes_list: list[str] = []
-            complete = True
-            for k in range(4):
-                a_idx = ifu_idx * 4 + k
-                if a_idx >= n_amp:
-                    complete = False
-                    break
-                data = _load_amp_npz(a_idx, e_idx)
-                if data is None:
-                    complete = False
-                    break
-                dm = np.array(data.get("delta_mult", np.full((fibers_per_amp,), np.nan)), dtype=float)
-                sm = np.array(data.get("source_mask", np.zeros((fibers_per_amp,), dtype=bool)), dtype=bool)
-                parts_delta.append(dm)
-                parts_mask.append(sm)
-                amp_labels.append(str(np.array(data.get("amp_label", ""))))
-                amp_ifuslots.append(str(np.array(data.get("ifuslot", f"a{a_idx:02d}"))))
-                notes_list.append(str(np.array(data.get("notes", ""))))
-            if not complete:
-                continue
-            # Concatenate into 448-length vectors: [amp0 fibers | amp1 | amp2 | amp3]
-            delta_448 = np.concatenate(parts_delta, axis=0).astype(np.float32)
-            mask_448 = np.concatenate(parts_mask, axis=0).astype(np.bool_)
-            # Save per-IFU file
-            save_ifu = ifu_plan.ifu_model_path(ifu_idx, e_idx)
-            np.savez_compressed(
-                save_ifu,
-                ifu=np.array(ifu_idx, dtype=np.int16),
-                exp=np.array(e_idx, dtype=np.int16),
-                delta_mult=delta_448,
-                source_mask=mask_448,
-                amp_labels=np.array(amp_labels),
-                amp_ifuslots=np.array(amp_ifuslots),
-                notes=np.array(" | ".join([n for n in notes_list if n])),
-            )
-            ifu_written += 1
-
-        # After assembling all exposures for this IFU, optionally create a per-IFU plot with one line per exposure
-        if opts.make_plots and plots_written < int(opts.max_plots):
-            try:
-                import matplotlib.pyplot as plt  # type: ignore
-                colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
-                plot_path = ifu_plan.ifu_plot_path(ifu_idx)
-                plot_path.parent.mkdir(parents=True, exist_ok=True)
-                fig, ax = plt.subplots(figsize=(10, 3.2))
-                x = np.arange(fibers_per_amp * 4)
-                have_any = False
-                for e_idx in range(n_exp):
-                    p = ifu_plan.ifu_model_path(ifu_idx, e_idx)
-                    if not p.exists():
-                        continue
-                    with np.load(p) as d:  # type: ignore[no-untyped-call]
-                        y = np.array(d.get("delta_mult", np.full((fibers_per_amp*4,), np.nan)), dtype=float)
-                        m = np.array(d.get("source_mask", np.zeros((fibers_per_amp*4,), dtype=bool)), dtype=bool)
-                    if not np.isfinite(y).any():
-                        continue
-                    have_any = True
-                    ax.plot(x, y, color=colors[e_idx % len(colors)], lw=1.2, alpha=0.9, label=f"exp {e_idx}")
-                    if np.any(m):
-                        # Mark masked fibers lightly on top
-                        ax.scatter(x[m], y[m], facecolors="none", edgecolors=colors[e_idx % len(colors)], s=12, linewidths=0.8, alpha=0.7)
-                title = f"IFU {ifu_idx:03d} — delta_mult per fiber (lines per exposure)"
-                ax.set_title(title)
-                ax.set_xlabel("fiber index (4 amps × 112)")
-                ax.set_ylabel("delta_mult")
-                ax.grid(True, alpha=0.2)
-                if have_any:
-                    ax.legend(loc="upper right", fontsize=8, ncol=min(4, n_exp))
-                    # Ensure y-limits non-degenerate
-                    try:
-                        ymins = [] ; ymaxs = []
-                        for line in ax.get_lines():
-                            yd = line.get_ydata()
-                            yfin = yd[np.isfinite(yd)]
-                            if yfin.size:
-                                ymins.append(float(np.nanmin(yfin)))
-                                ymaxs.append(float(np.nanmax(yfin)))
-                        if ymins and ymaxs:
-                            ymin, ymax = min(ymins), max(ymaxs)
-                            if not (ymax > ymin):
-                                pad = 0.05 * max(1.0, abs(ymax) if np.isfinite(ymax) else 1.0)
-                                ax.set_ylim(ymin - pad, ymax + pad)
-                    except Exception:
-                        pass
-                fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                plots_written += 1
-            except Exception:
-                pass
-
-    # Write a small manifest
+    # Write a small manifest (unchanged schema)
     manifest = {
         "inputs": [str(h5file)],
         "shot_dir": str(out.resolve()),
-        "ifu_dir": str(ifu_out.resolve()),
-        "plots_dir": str(getattr(ifu_plan, "plots_dir", ifu_out / "plots")),
-        "n_written": int(n_written),
-        "n_skipped": int(n_skipped),
-        "ifu_written": int(ifu_written),
-        "plots_written": int(plots_written),
+        "ifu_dir": str(ifu_plan.ifu_dir.resolve()),
+        "plots_dir": str(getattr(ifu_plan, "plots_dir", ifu_plan.ifu_dir / "plots")),
+        "n_written": int(ctx.n_written),
+        "n_skipped": int(ctx.n_skipped),
+        "ifu_written": int(ctx.ifu_written),
+        "plots_written": int(ctx.plots_written),
         "options": {
             "wave_mask_frac": float(opts.wave_mask_frac),
             "k_source": float(opts.k_source),

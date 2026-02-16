@@ -1,6 +1,31 @@
 """High-level pipeline entry point for processing a single shot.
 
-Implements the staged SingleShot workflow with resumable artifacts.
+Mathematical overview
+---------------------
+We model the per-amplifier, per-exposure sky signal using shared exposure-level
+references and low-parameter corrections. Key arrays:
+  - BW_amp[a,e,w]: robust per-amplifier spectra (biweight over 112 fibers).
+  - BW_full[e,w]: robust per-exposure spectra (biweight over amplifiers).
+  - mult[a,e]: per-(amp,exp) multiplicative scale from "Fit_Multiplicative_Scale".
+  - mult_hat[a,e]: 2D polynomial field prediction of mult vs. (x,y) from
+    "Fit_Poly2D_Field_Model" (stored as key "pred" with shape (n_amp, n_exp)).
+
+Conceptually, the modeled amplifier spectrum is
+  Model_amp[a,e,w] = mult_hat[a,e] * BW_full[e,w] + Poly1D_a[a](w) + PCA_e[e](w; c[a,e,:])
+where Poly1D_a is a per-amp additive polynomial (shared across exposures) and
+PCA_e are exposure-specific additive components with per-amp coefficients c.
+
+Amp-fit residuals (Stage 06) are formed on the wavelength mask W as
+  residual[a,e,W] = (BW_amp[a,e,W] / mult_hat[a,e]) - BW_full[e,W] - Poly1D_a[a](W) - mu_e[W]
+We then solve for c[a,e,:] by projecting these centered residuals onto the PCA
+basis V_e[:,W] with a robust linear least-squares. (Note: the implementation may
+fall back to using mult[a,e] for the division step; the Poly2D intent is shown
+here to reflect the target formulation.)
+
+Pipeline structure
+------------------
+This module implements the staged SingleShot workflow with resumable artifacts.
+Artifacts are addressed via ShotPlan using semantic keys (and legacy fallbacks).
 """
 from __future__ import annotations
 
