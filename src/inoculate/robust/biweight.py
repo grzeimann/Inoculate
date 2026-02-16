@@ -43,7 +43,7 @@ def biweight_location(x: np.ndarray, axis: int | None = None) -> np.ndarray:
     Uses astropy.stats.biweight_location if available, else nanmedian.
     """
     if _astro_biweight_location is not None:  # pragma: no cover - depends on env
-        return _astro_biweight_location(x, axis=axis)
+        return _astro_biweight_location(x, ignore_nan=True, axis=axis)
     with np.errstate(all="ignore"):
         return np.nanmedian(np.asanyarray(x), axis=axis)
 
@@ -54,5 +54,5 @@ def biweight_scale(x: np.ndarray, axis: int | None = None) -> np.ndarray:
     Uses astropy.stats.biweight_scale if available, else MAD.
     """
     if _astro_biweight_scale is not None:  # pragma: no cover - depends on env
-        return _astro_biweight_scale(x, axis=axis)
+        return _astro_biweight_scale(x, ignore_nan=True, axis=axis)
     return mad(np.asanyarray(x), axis=axis)

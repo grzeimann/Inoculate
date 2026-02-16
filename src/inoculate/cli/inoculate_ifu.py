@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wave-mask-frac", type=float, default=0.8, help="Central fraction of wavelengths to use for robust per-fiber ratios (default: 0.8)")
     p.add_argument("--k-source", type=float, default=5.0, help="MAD threshold multiplier for source masking across fibers (default: 5.0)")
     p.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
+    p.add_argument("--make-plots", action="store_true", help="Write example IFU diagnostic plots (delta_mult vs fiber)")
+    p.add_argument("--max-plots", type=int, default=6, help="Maximum number of diagnostic plots to write (default: 6)")
     return p
 
 
@@ -71,7 +73,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning("Output directory %s does not exist yet; proceeding (it will be created if needed)", outdir)
 
     ifu_list = _parse_ifus(args.ifus)
-    opts = IFUOptions(wave_mask_frac=float(args.wave_mask_frac), k_source=float(args.k_source))
+    opts = IFUOptions(
+        wave_mask_frac=float(args.wave_mask_frac),
+        k_source=float(args.k_source),
+        make_plots=bool(args.make_plots),
+        max_plots=int(args.max_plots),
+    )
 
     result = run_ifu(str(h5), str(outdir), ifu_indices=ifu_list, resume=bool(args.resume), options=opts)
 

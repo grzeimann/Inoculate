@@ -30,27 +30,26 @@ logger = logging.getLogger(__name__)
 
 
 def _wave_mask(n_wave: int, frac: float) -> np.ndarray:
-    """Return a fixed-index wavelength mask using [40 : n-25].
+    """Return a central-fraction wavelength mask, as used previously.
 
-    This overrides the previous central-fraction behavior. The mask is used for
-    modeling (multiplicative estimation, PCA, and additive polynomial fits) but
-    residuals may still be computed and reported over the full wavelength grid.
+    The mask selects a contiguous central window covering ``frac`` of the
+    wavelength grid. This behavior matches the earlier pipeline and ensures
+    consistent scaling for BW_full in diagnostics like bw_amp_vs_full.
 
     Args:
         n_wave: Number of wavelength samples.
-        frac: Unused (kept for signature compatibility).
+        frac: Fraction (0..1] of central wavelengths to keep.
 
     Returns:
-        Boolean array of shape (n_wave,), True for indices in [40, n_wave-25).
-        If ``n_wave <= 65`` the function falls back to an all-True mask.
+        Boolean array of shape (n_wave,), True within the central window.
     """
-    # Guard for very short spectra
-    if n_wave <= 65:
-        return np.ones(n_wave, dtype=bool)
-    start = 40
-    stop = max(start, n_wave - 25)
-    mask = np.zeros(n_wave, dtype=bool)
-    mask[start:stop] = True
+    # Clip fraction to a safe range and compute central window
+    frac = float(np.clip(frac, 0.05, 1.0))
+    n = int(max(1, round(frac * int(n_wave))))
+    start = (int(n_wave) - n) // 2
+    end = start + n
+    mask = np.zeros(int(n_wave), dtype=bool)
+    mask[start:end] = True
     return mask
 
 
@@ -108,6 +107,16 @@ def run_shot(
 
     # Construct wavelength mask
     wmask = _wave_mask(n_wave, ms.wave_mask_frac)
+    try:
+        idx = np.flatnonzero(wmask)
+        if idx.size > 0:
+            start_i, end_i = int(idx[0]), int(idx[-1]) + 1
+            logger.info(
+                "[Stage 00] Wavelength mask: requested frac=%.2f -> indices [%d:%d] (effective %.3f of grid)",
+                float(ms.wave_mask_frac), start_i, end_i, float(wmask.mean())
+            )
+    except Exception:
+        pass
 
     # Stage 01 — Compute BW_amp
     stage01 = paths["stage_01_bw_amp"]

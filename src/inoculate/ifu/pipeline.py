@@ -32,6 +32,8 @@ from ..robust import biweight_location, mad
 class IFUOptions:
     wave_mask_frac: float = 0.8  # central fraction of wavelengths to use
     k_source: float = 5.0        # MAD threshold for source masking across fibers
+    make_plots: bool = False     # write example IFU diagnostic plots
+    max_plots: int = 6           # maximum number of example plots to write
 
 
 def _wave_mask(n_wave: int, frac: float) -> np.ndarray:
@@ -153,6 +155,7 @@ def run_ifu(
     # Load artifacts and labels
     artifacts = _load_shot_artifacts(out)
     bw_full = artifacts["bw_full"]  # (n_exp, n_wave)
+    bw_amp = artifacts["bw_amp"]    # (n_amp, n_exp, n_wave)
     n_exp, n_wave = int(bw_full.shape[0]), int(bw_full.shape[1])
     wmask = _wave_mask(n_wave, opts.wave_mask_frac)
     ls = _latest_labelset(out)
@@ -185,8 +188,9 @@ def run_ifu(
 
     n_written = 0
     n_skipped = 0
+    plots_written = 0
 
-    for a, e, s, arrays in h5.iter_amp_blocks(["spectrum"]):
+    for a, e, s, arrays in h5.iter_amp_blocks(["spectrum", "skyspectrum"]):
         if a not in amps_to_do:
             continue
         # Only proceed if exposure matches our expectations
@@ -197,7 +201,10 @@ def run_ifu(
             n_skipped += 1
             continue
 
-        Y = arrays["spectrum"].astype(float)  # (fibers_per_amp, n_wave)
+        # Construct total flux per fiber: spectrum + skyspectrum
+        spec = arrays["spectrum"].astype(float)
+        sky = arrays["skyspectrum"].astype(float)
+        Y = spec + sky  # (fibers_per_amp, n_wave)
         if Y.shape[0] != fibers_per_amp or Y.shape[1] != n_wave:
             # shape mismatch; skip gracefully
             n_skipped += 1
@@ -213,8 +220,11 @@ def run_ifu(
             source_mask = np.zeros(fibers_per_amp, dtype=bool)
             notes = "ZERO amp: outputs left at zero; no computation performed"
         else:
-            # Provisional per-fiber delta_mult via robust ratio to BW_full
-            ref = bw_full[e, wmask]
+            # Provisional per-fiber delta_mult via robust ratio to the amp's expected sky
+            # Use exposure-level baseline scaled by the amp's multiplicative factor to avoid
+            # trivial self-division that can collapse to ones.
+            mult = artifacts["mult"][a, e]
+            ref = bw_full[e, wmask] * (mult if np.isfinite(mult) else np.nan)
             with np.errstate(all="ignore"):
                 ratio = Y[:, wmask] / np.where(np.abs(ref) > 0, ref, np.nan)
             # Use biweight location across wavelength per fiber; fallback to nanmedian if needed
@@ -235,6 +245,8 @@ def run_ifu(
                 med = np.nan
                 scale = np.nan
                 source_mask = np.zeros(fibers_per_amp, dtype=bool)
+                # No finite per-fiber estimates; fall back to unity so plots are not blank
+                delta_mult = np.ones(fibers_per_amp, dtype=float)
             else:
                 med = float(np.nanmedian(delta_mult[finite]))
                 try:
@@ -275,16 +287,132 @@ def run_ifu(
         )
         n_written += 1
 
+    # Aggregate per-IFU (4 amps per IFU) outputs into 448-length vectors per exposure
+    # We will load any missing per-amp results from disk (e.g., when --resume skipped computation).
+    def _load_amp_npz(a_idx: int, e_idx: int) -> Optional[dict]:
+        p = ifu_plan.fiber_model_path(a_idx, e_idx)
+        if not p.exists():
+            return None
+        try:
+            with np.load(p) as d:  # type: ignore[no-untyped-call]
+                return {k: d[k] for k in d.files}
+        except Exception:
+            return None
+
+    ifu_written = 0
+    n_ifu = (n_amp + 3) // 4  # assume 4 amps per IFU in order
+    for ifu_idx in range(n_ifu):
+        for e_idx in range(n_exp):
+            # collect four amps for this IFU
+            parts_delta: list[np.ndarray] = []
+            parts_mask: list[np.ndarray] = []
+            amp_labels: list[str] = []
+            amp_ifuslots: list[str] = []
+            notes_list: list[str] = []
+            complete = True
+            for k in range(4):
+                a_idx = ifu_idx * 4 + k
+                if a_idx >= n_amp:
+                    complete = False
+                    break
+                data = _load_amp_npz(a_idx, e_idx)
+                if data is None:
+                    complete = False
+                    break
+                dm = np.array(data.get("delta_mult", np.full((fibers_per_amp,), np.nan)), dtype=float)
+                sm = np.array(data.get("source_mask", np.zeros((fibers_per_amp,), dtype=bool)), dtype=bool)
+                parts_delta.append(dm)
+                parts_mask.append(sm)
+                amp_labels.append(str(np.array(data.get("amp_label", ""))))
+                amp_ifuslots.append(str(np.array(data.get("ifuslot", f"a{a_idx:02d}"))))
+                notes_list.append(str(np.array(data.get("notes", ""))))
+            if not complete:
+                continue
+            # Concatenate into 448-length vectors: [amp0 fibers | amp1 | amp2 | amp3]
+            delta_448 = np.concatenate(parts_delta, axis=0).astype(np.float32)
+            mask_448 = np.concatenate(parts_mask, axis=0).astype(np.bool_)
+            # Save per-IFU file
+            save_ifu = ifu_plan.ifu_model_path(ifu_idx, e_idx)
+            np.savez_compressed(
+                save_ifu,
+                ifu=np.array(ifu_idx, dtype=np.int16),
+                exp=np.array(e_idx, dtype=np.int16),
+                delta_mult=delta_448,
+                source_mask=mask_448,
+                amp_labels=np.array(amp_labels),
+                amp_ifuslots=np.array(amp_ifuslots),
+                notes=np.array(" | ".join([n for n in notes_list if n])),
+            )
+            ifu_written += 1
+
+        # After assembling all exposures for this IFU, optionally create a per-IFU plot with one line per exposure
+        if opts.make_plots and plots_written < int(opts.max_plots):
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
+                colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+                plot_path = ifu_plan.ifu_plot_path(ifu_idx)
+                plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig, ax = plt.subplots(figsize=(10, 3.2))
+                x = np.arange(fibers_per_amp * 4)
+                have_any = False
+                for e_idx in range(n_exp):
+                    p = ifu_plan.ifu_model_path(ifu_idx, e_idx)
+                    if not p.exists():
+                        continue
+                    with np.load(p) as d:  # type: ignore[no-untyped-call]
+                        y = np.array(d.get("delta_mult", np.full((fibers_per_amp*4,), np.nan)), dtype=float)
+                        m = np.array(d.get("source_mask", np.zeros((fibers_per_amp*4,), dtype=bool)), dtype=bool)
+                    if not np.isfinite(y).any():
+                        continue
+                    have_any = True
+                    ax.plot(x, y, color=colors[e_idx % len(colors)], lw=1.2, alpha=0.9, label=f"exp {e_idx}")
+                    if np.any(m):
+                        # Mark masked fibers lightly on top
+                        ax.scatter(x[m], y[m], facecolors="none", edgecolors=colors[e_idx % len(colors)], s=12, linewidths=0.8, alpha=0.7)
+                title = f"IFU {ifu_idx:03d} — delta_mult per fiber (lines per exposure)"
+                ax.set_title(title)
+                ax.set_xlabel("fiber index (4 amps × 112)")
+                ax.set_ylabel("delta_mult")
+                ax.grid(True, alpha=0.2)
+                if have_any:
+                    ax.legend(loc="upper right", fontsize=8, ncol=min(4, n_exp))
+                    # Ensure y-limits non-degenerate
+                    try:
+                        ymins = [] ; ymaxs = []
+                        for line in ax.get_lines():
+                            yd = line.get_ydata()
+                            yfin = yd[np.isfinite(yd)]
+                            if yfin.size:
+                                ymins.append(float(np.nanmin(yfin)))
+                                ymaxs.append(float(np.nanmax(yfin)))
+                        if ymins and ymaxs:
+                            ymin, ymax = min(ymins), max(ymaxs)
+                            if not (ymax > ymin):
+                                pad = 0.05 * max(1.0, abs(ymax) if np.isfinite(ymax) else 1.0)
+                                ax.set_ylim(ymin - pad, ymax + pad)
+                    except Exception:
+                        pass
+                fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                plots_written += 1
+            except Exception:
+                pass
+
     # Write a small manifest
     manifest = {
         "inputs": [str(h5file)],
         "shot_dir": str(out.resolve()),
         "ifu_dir": str(ifu_out.resolve()),
+        "plots_dir": str(getattr(ifu_plan, "plots_dir", ifu_out / "plots")),
         "n_written": int(n_written),
         "n_skipped": int(n_skipped),
+        "ifu_written": int(ifu_written),
+        "plots_written": int(plots_written),
         "options": {
             "wave_mask_frac": float(opts.wave_mask_frac),
             "k_source": float(opts.k_source),
+            "make_plots": bool(opts.make_plots),
+            "max_plots": int(opts.max_plots),
         },
     }
     with ifu_plan.manifest_path().open("w", encoding="utf-8") as f:
