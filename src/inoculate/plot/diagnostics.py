@@ -35,19 +35,26 @@ def _load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 def _stage_paths(outdir: str | Path) -> Dict[str, Path]:
-    # Use centralized ShotPlan for path resolution, but keep legacy keys
+    # Use centralized ShotPlan for path resolution with semantic keys (fallback to legacy)
     from ..shot.plan import ShotPlan
     plan = ShotPlan(Path(outdir))
     sp = plan.paths()
+    def pick(*keys: str) -> Path:
+        for k in keys:
+            p = sp.get(k)
+            if p is not None:
+                return p
+        # Last resort: raise using the last key name
+        raise KeyError(keys[-1])
     return {
-        "bw_amp": sp["stage_01_bw_amp"],
-        "bw_full": sp["stage_02_bw_full"],
-        "qc": sp["stage_03_qc"],
-        "mult": sp["stage_04_mult"],
-        "mult_poly2d": sp["stage_0425_mult_poly2d"],
-        "pca": sp["stage_05_pca"],
-        "fits": sp["stage_06_amp_fits"],
-        "info": sp["stage_00_info"],
+        "bw_amp": pick("Build_Amplifier_Robust_Spectra", "stage_01_bw_amp"),
+        "bw_full": pick("Build_Full_Exposure_Sky", "stage_02_bw_full"),
+        "qc": pick("Compute_QC_Features", "stage_03_qc"),
+        "mult": pick("Fit_Multiplicative_Scale", "stage_04_mult"),
+        "mult_poly2d": pick("Fit_Poly2D_Field_Model", "stage_0425_mult_poly2d"),
+        "pca": pick("Build_PCA_Components", "stage_05_pca"),
+        "fits": pick("Write_Amp_Fits", "stage_06_amp_fits"),
+        "info": pick("Validate_Input_Shot_Info", "stage_00_info"),
     }
 
 

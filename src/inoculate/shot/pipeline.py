@@ -29,6 +29,368 @@ from ..utils import SchemaError
 logger = logging.getLogger(__name__)
 
 
+# ---- Minimal Stage abstraction (Phase B) ----
+from dataclasses import dataclass
+
+
+@dataclass
+class _Context:
+    h5file: str
+    outdir: Path
+    ms: ModelSpec
+    plan: Any
+    # ephemeral/stateful fields propagated between stages
+    info: Dict[str, Any] | None = None
+    wmask: np.ndarray | None = None
+    bw_amp: np.ndarray | None = None
+    bw_full: np.ndarray | None = None
+    ls: Any | None = None
+    mult: np.ndarray | None = None
+    poly2d_pred: np.ndarray | None = None
+
+
+class _Stage:
+    key: str = ""
+    produces: tuple[str, ...] = ()
+
+    def should_run(self, ctx: _Context, resume: bool) -> bool:
+        # Run if any produced artifact is missing, else skip when resume=True
+        paths = ctx.plan.paths()
+        if not self.produces:
+            return True
+        missing = [k for k in self.produces if (paths.get(k) is None or not paths[k].exists())]
+        return (len(missing) > 0) or (not resume)
+
+    def run(self, ctx: _Context) -> None:  # pragma: no cover - overridden per stage
+        raise NotImplementedError
+
+
+def _execute_stages(stages: list[_Stage], ctx: _Context, *, resume: bool = True) -> None:
+    for st in stages:
+        try:
+            if st.should_run(ctx, resume):
+                logger.info("[%s] start", st.key or st.__class__.__name__)
+                st.run(ctx)
+            else:
+                logger.info("[%s] resume: artifacts present, skipping", st.key or st.__class__.__name__)
+        except Exception:
+            logger.exception("Stage failed: %s", st.key or st.__class__.__name__)
+            raise
+
+
+class _Stage00Info(_Stage):
+    key = "Validate_Input_Shot_Info"
+    produces = ("Validate_Input_Shot_Info",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p = paths["Validate_Input_Shot_Info"]
+        h5 = H5VIRUS(ctx.h5file)
+        info = h5.read_info()
+        with p.open("w", encoding="utf-8") as f:
+            json.dump({k: (int(v) if isinstance(v, np.integer) else (v.tolist() if hasattr(v, 'dtype') else v)) for k, v in info.items()}, f, indent=2)
+        ctx.info = info
+        # build wavelength mask
+        n_wave = int(info["n_wave"])  # type: ignore[index]
+        ctx.wmask = _wave_mask(n_wave, ctx.ms.wave_mask_frac)
+        try:
+            idx = np.flatnonzero(ctx.wmask)
+            if idx.size > 0:
+                logger.info("[Stage 00] Wavelength mask frac=%.2f -> [%d:%d] (%.3f)", float(ctx.ms.wave_mask_frac), int(idx[0]), int(idx[-1])+1, float(ctx.wmask.mean()))
+        except Exception:
+            pass
+
+
+class _Stage01BwAmp(_Stage):
+    key = "Build_Amplifier_Robust_Spectra"
+    produces = ("Build_Amplifier_Robust_Spectra",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p = paths["Build_Amplifier_Robust_Spectra"]
+        h5 = H5VIRUS(ctx.h5file)
+        bw_amp = compute_bw_amp(h5)
+        np.savez_compressed(p, bw_amp=bw_amp)
+        ctx.bw_amp = bw_amp
+
+
+class _Stage02BwFull(_Stage):
+    key = "Build_Full_Exposure_Sky"
+    produces = ("Build_Full_Exposure_Sky",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_in = paths["Build_Amplifier_Robust_Spectra"]
+        p_out = paths["Build_Full_Exposure_Sky"]
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(p_in)["bw_amp"]
+        bw_full = compute_bw_full(bw_amp)
+        np.savez_compressed(p_out, bw_full=bw_full)
+        ctx.bw_full = bw_full
+
+
+class _Stage03QCInitLabels(_Stage):
+    key = "Compute_QC_Features"
+    produces = ("Compute_QC_Features", "Initialize_Iterative_Labels")
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_bw_amp = paths["Build_Amplifier_Robust_Spectra"]
+        p_bw_full = paths["Build_Full_Exposure_Sky"]
+        p_qc = paths["Compute_QC_Features"]
+        p_labels = paths["Initialize_Iterative_Labels"]
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(p_bw_amp)["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(p_bw_full)["bw_full"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        df_feat = compute_amp_features(bw_amp, bw_full, wmask)
+        df_labels, _gm = label_amps(df_feat)
+        df = df_feat.merge(df_labels, on="amp", how="left")
+        write_parquet(df, p_qc)
+        ls = LabelSet.from_features(df_feat)
+        save_labelset(p_labels, ls)
+        ctx.ls = ls
+
+
+class _Stage04Mult(_Stage):
+    key = "Fit_Multiplicative_Scale"
+    produces = ("Fit_Multiplicative_Scale", "Labels_After_Mult")
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_bw_amp = paths["Build_Amplifier_Robust_Spectra"]
+        p_bw_full = paths["Build_Full_Exposure_Sky"]
+        p_out = paths["Fit_Multiplicative_Scale"]
+        p_labels = paths["Labels_After_Mult"]
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(p_bw_amp)["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(p_bw_full)["bw_full"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        ls = ctx.ls if ctx.ls is not None else None
+        good_mask = (ls.good_mask() if ls is not None else np.ones(bw_amp.shape[0], dtype=bool))
+        mult = build_mult_scale(bw_amp, bw_full, good_mask, wmask, bounds=ctx.ms.mult_bounds)
+        np.savez_compressed(p_out, mult_scale=mult)
+        if ls is None:
+            # lazy init from parquet if needed
+            import pandas as pd
+            df = pd.read_parquet(paths["Compute_QC_Features"])
+            ls = LabelSet.from_features(df)
+        ls.update_with_mult(mult, bounds=ctx.ms.mult_bounds)
+        if not p_labels.exists():
+            save_labelset(p_labels, ls)
+        ctx.ls = ls
+        ctx.mult = mult
+
+
+class _Stage0425Poly2D(_Stage):
+    key = "Fit_Poly2D_Field_Model"
+    produces = ("Fit_Poly2D_Field_Model", "Labels_After_Poly2D")
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_out = paths["Fit_Poly2D_Field_Model"]
+        p_labels = paths["Labels_After_Poly2D"]
+        # ensure mult is available
+        if ctx.mult is None:
+            mult = _load_npz(paths["Fit_Multiplicative_Scale"]) ["mult_scale"]
+        else:
+            mult = ctx.mult
+        h5 = H5VIRUS(ctx.h5file)
+        poly2d = build_mult_poly2d(
+            h5,
+            mult,
+            degree=int(ctx.ms.poly_degree),
+            loss=ctx.ms.robust_loss,
+            huber_delta=ctx.ms.huber_delta,
+            tukey_c=ctx.ms.tukey_c,
+        )
+        np.savez_compressed(
+            p_out,
+            degree=int(poly2d.degree),
+            coeffs=poly2d.coeffs,
+            ra_amp=poly2d.ra_amp,
+            dec_amp=poly2d.dec_amp,
+            x=poly2d.x,
+            y=poly2d.y,
+            pred=poly2d.pred,
+        )
+        # update labels
+        ls = ctx.ls if ctx.ls is not None else None
+        if ls is None:
+            # load latest labels if not in ctx
+            from ..qc.labels import discover_latest_snapshot
+            ls = discover_latest_snapshot(ctx.outdir) or LabelSet.initialize(mult.shape[0], mult.shape[1])
+        ls.update_with_poly2d(mult, poly2d.pred)
+        if not p_labels.exists():
+            save_labelset(p_labels, ls)
+        ctx.ls = ls
+        ctx.poly2d_pred = poly2d.pred
+
+
+class _Stage045Poly(_Stage):
+    key = "Build_Additive_Polynomial"
+    produces = ("Build_Additive_Polynomial",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_out = paths["Build_Additive_Polynomial"]
+        # Load required inputs
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(paths["Build_Amplifier_Robust_Spectra"])["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(paths["Build_Full_Exposure_Sky"])["bw_full"]
+        mult = ctx.mult if ctx.mult is not None else _load_npz(paths["Fit_Multiplicative_Scale"])["mult_scale"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        logger.info("[Build_Additive_Polynomial] Fit shared additive polynomial per amplifier")
+        beta_all = build_amp_poly(
+            bw_amp,
+            bw_full,
+            mult,
+            wmask,
+            order=ctx.ms.poly_order,
+            loss=ctx.ms.robust_loss,
+            huber_delta=ctx.ms.huber_delta,
+            tukey_c=ctx.ms.tukey_c,
+        )
+        np.savez_compressed(p_out, poly_beta=beta_all)
+
+
+class _Stage05PCA(_Stage):
+    key = "Build_PCA_Components"
+    produces = ("Build_PCA_Components",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_out = paths["Build_PCA_Components"]
+        # Inputs
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(paths["Build_Amplifier_Robust_Spectra"])["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(paths["Build_Full_Exposure_Sky"])["bw_full"]
+        mult = ctx.mult if ctx.mult is not None else _load_npz(paths["Fit_Multiplicative_Scale"])["mult_scale"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        beta_all = _load_npz(paths["Build_Additive_Polynomial"]) ["poly_beta"]
+        # good_mask from labels if available
+        from ..qc.labels import discover_latest_snapshot
+        ls = ctx.ls if ctx.ls is not None else (discover_latest_snapshot(ctx.outdir) or None)
+        good_mask = (ls.good_mask() if ls is not None else np.ones(bw_amp.shape[0], dtype=bool))
+        logger.info("[Build_PCA_Components] Build shot PCA basis")
+        pca = build_shot_pca(
+            bw_amp,
+            bw_full,
+            mult,
+            good_mask,
+            wmask,
+            beta_all,
+            n_components=ctx.ms.n_pca,
+            loss=ctx.ms.robust_loss,
+            huber_delta=ctx.ms.huber_delta,
+            tukey_c=ctx.ms.tukey_c,
+        )
+        np.savez_compressed(p_out, **pca)
+
+
+class _Stage06AmpFits(_Stage):
+    key = "Write_Amp_Fits"
+    produces = ("Write_Amp_Fits",)
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        p_out = paths["Write_Amp_Fits"]
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(paths["Build_Amplifier_Robust_Spectra"])["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(paths["Build_Full_Exposure_Sky"])["bw_full"]
+        mult = ctx.mult if ctx.mult is not None else _load_npz(paths["Fit_Multiplicative_Scale"])["mult_scale"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        beta_all = _load_npz(paths["Build_Additive_Polynomial"]) ["poly_beta"]
+        pca = _load_npz(paths["Build_PCA_Components"])  # contains 'pca_mean' and 'pca_evecs'
+        logger.info("[Write_Amp_Fits] Fit amplifiers: shared poly + PCA coeffs")
+        df_fits = _fit_all_amps(
+            bw_amp,
+            bw_full,
+            mult,
+            pca,
+            wmask,
+            beta_all,
+            loss=ctx.ms.robust_loss,
+            huber_delta=ctx.ms.huber_delta,
+            tukey_c=ctx.ms.tukey_c,
+        )
+        write_parquet(df_fits, p_out)
+
+
+class _Stage07Manifest(_Stage):
+    key = "Write_Model_Start_Manifest"
+    produces = ("Write_Model_Start_Manifest", "Stage_Stats")
+
+    def run(self, ctx: _Context) -> None:
+        from .plan import ShotPlan
+        paths = ctx.plan.paths() if hasattr(ctx.plan, "paths") else ShotPlan(ctx.outdir).paths()
+        # Try to read info for stats
+        try:
+            with paths["Validate_Input_Shot_Info"].open("r", encoding="utf-8") as f:
+                info = json.load(f)
+        except Exception:
+            info = ctx.info or {}
+        n_amp = int(info.get("n_amp", 0)) if info else 0
+        n_exp = int(info.get("exposures", 0)) if info else 0
+        n_wave = int(info.get("n_wave", 0)) if info else 0
+        # Inputs for stats
+        bw_amp = ctx.bw_amp if ctx.bw_amp is not None else _load_npz(paths["Build_Amplifier_Robust_Spectra"]) ["bw_amp"]
+        bw_full = ctx.bw_full if ctx.bw_full is not None else _load_npz(paths["Build_Full_Exposure_Sky"]) ["bw_full"]
+        wmask = ctx.wmask if ctx.wmask is not None else _wave_mask(int(bw_full.shape[1]), ctx.ms.wave_mask_frac)
+        # Resolve latest labels for good_mask
+        from ..qc.labels import discover_latest_snapshot
+        ls = ctx.ls if ctx.ls is not None else discover_latest_snapshot(ctx.outdir)
+        good_mask = ls.good_mask() if (ls is not None and hasattr(ls, "good_mask")) else np.ones(bw_amp.shape[0], dtype=bool)
+        # Stage stats
+        stage_stats_path = paths.get("Stage_Stats")
+        try:
+            stats: Dict[str, Any] = {
+                "mask_frac": float(np.mean(wmask)) if wmask.size else 0.0,
+                "bw_amp_nonfinite_frac": float((~np.isfinite(bw_amp)).mean()) if isinstance(bw_amp, np.ndarray) else None,
+                "bw_full_nonfinite_frac": float((~np.isfinite(bw_full)).mean()) if isinstance(bw_full, np.ndarray) else None,
+                "n_amp": int(n_amp),
+                "n_exp": int(n_exp),
+                "n_wave": int(n_wave),
+                "n_good_amps": int(np.sum(good_mask)) if isinstance(good_mask, np.ndarray) and good_mask.size else 0,
+                "n_bad_amps": int(n_amp - int(np.sum(good_mask))) if isinstance(good_mask, np.ndarray) and good_mask.size else int(n_amp),
+            }
+            if stage_stats_path is not None:
+                with stage_stats_path.open("w", encoding="utf-8") as f:
+                    json.dump(stats, f, indent=2)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to write stage_stats: %s", exc)
+        # Manifest
+        p_manifest = paths["Write_Model_Start_Manifest"]
+        logger.info("[Write_Model_Start_Manifest] Write model-start manifest")
+        manifest = {
+            "inputs": [str(ctx.h5file)],
+            "outputs": [
+                str(paths[k]) for k in (
+                    "Validate_Input_Shot_Info",
+                    "Build_Amplifier_Robust_Spectra",
+                    "Build_Full_Exposure_Sky",
+                    "Compute_QC_Features",
+                    "Fit_Multiplicative_Scale",
+                    "Fit_Poly2D_Field_Model",
+                    "Build_Additive_Polynomial",
+                    "Build_PCA_Components",
+                    "Write_Amp_Fits",
+                    "Write_Model_Start_Manifest",
+                )
+            ],
+            "modelspec": ctx.ms.to_dict(),
+            "work_dir": str(Path(ctx.outdir).resolve()),
+            "stage_stats": str(stage_stats_path) if stage_stats_path else None,
+        }
+        with p_manifest.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+
+# ---- Existing helpers and pipeline entry point ----
+
 def _wave_mask(n_wave: int, frac: float) -> np.ndarray:
     """Return a central-fraction wavelength mask, as used previously.
 
@@ -66,6 +428,7 @@ def run_shot(
     resume: bool = True,
     make_plots: bool = False,
     max_plots: int = 12,
+    suppress_warnings: bool = False,
 ) -> Dict[str, Any]:
     """Run the Inoculate pipeline for a single shot.
 
@@ -89,233 +452,56 @@ def run_shot(
     plan = ShotPlan(out)
     paths = plan.paths()
 
-    # Stage 00 — Info + schema validation
-    stage00 = paths["stage_00_info"]
-    if not (resume and stage00.exists()):
-        logger.info("[Stage 00] Info + schema validation")
-        h5 = H5VIRUS(h5file)
-        info = h5.read_info()  # may raise SchemaError
-        with stage00.open("w", encoding="utf-8") as f:
-            json.dump({k: (int(v) if isinstance(v, np.integer) else (v.tolist() if hasattr(v, 'dtype') else v)) for k, v in info.items()}, f, indent=2)
+    import warnings
+    ctx = _Context(h5file=h5file, outdir=out, ms=ms, plan=plan)
+    def _run_all() -> None:
+        stages: list[_Stage] = [
+            _Stage00Info(),
+            _Stage01BwAmp(),
+            _Stage02BwFull(),
+            _Stage03QCInitLabels(),
+            _Stage04Mult(),
+            _Stage0425Poly2D(),
+            _Stage045Poly(),
+            _Stage05PCA(),
+            _Stage06AmpFits(),
+            _Stage07Manifest(),
+        ]
+        _execute_stages(stages, ctx, resume=resume)
+        # Optional diagnostics plotting (post-run; load latest labels for good_mask)
+        if make_plots:
+            try:
+                from ..qc.labels import discover_latest_snapshot
+                from ..plot import plot_bw_amp_vs_full, plot_mult_by_amp, plot_fit_example  # type: ignore
+                plots_dir = out / "plots"
+                plots_dir.mkdir(exist_ok=True)
+                # 1) Multiplicative summary across all amps
+                plot_mult_by_amp(out, highlight_outliers=True, show_labels=True, save=plots_dir / "mult_by_amp.png")
+                # 2) Choose a representative amp (first good, else 0) and exposure 0
+                ls_latest = discover_latest_snapshot(out)
+                bw_amp_arr = _load_npz(paths["Build_Amplifier_Robust_Spectra"]) ["bw_amp"]
+                good_mask = ls_latest.good_mask() if (ls_latest is not None) else np.ones(bw_amp_arr.shape[0], dtype=bool)
+                a_sel = int(np.where(good_mask)[0][0]) if np.any(good_mask) else 0
+                e_sel = 0
+                # 3) Single-amp comparison and fit example
+                plot_bw_amp_vs_full(out, amp=a_sel, exp=e_sel, save=plots_dir / f"bw_amp_vs_full_a{a_sel}_e{e_sel}.png")
+                plot_fit_example(out, amp=a_sel, exp=e_sel, save=plots_dir / f"fit_example_a{a_sel}_e{e_sel}.png")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Plot generation failed: %s", exc)
+
+    if suppress_warnings:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", category=UserWarning, module=r"astropy\\.stats")
+            warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"astropy\\.stats")
+            _run_all()
     else:
-        with stage00.open("r", encoding="utf-8") as f:
-            info = json.load(f)
-
-    n_amp = int(info["n_amp"])  # type: ignore[index]
-    n_exp = int(info["exposures"])  # type: ignore[index]
-    n_wave = int(info["n_wave"])  # type: ignore[index]
-
-    # Construct wavelength mask
-    wmask = _wave_mask(n_wave, ms.wave_mask_frac)
-    try:
-        idx = np.flatnonzero(wmask)
-        if idx.size > 0:
-            start_i, end_i = int(idx[0]), int(idx[-1]) + 1
-            logger.info(
-                "[Stage 00] Wavelength mask: requested frac=%.2f -> indices [%d:%d] (effective %.3f of grid)",
-                float(ms.wave_mask_frac), start_i, end_i, float(wmask.mean())
-            )
-    except Exception:
-        pass
-
-    # Stage 01 — Compute BW_amp
-    stage01 = paths["stage_01_bw_amp"]
-    if not (resume and stage01.exists()):
-        logger.info("[Stage 01] Compute BW_amp")
-        h5 = H5VIRUS(h5file)
-        bw_amp = compute_bw_amp(h5)
-        np.savez_compressed(stage01, bw_amp=bw_amp)
-    else:
-        bw_amp = _load_npz(stage01)["bw_amp"]
-
-    # Stage 02 — Compute BW_full
-    stage02 = paths["stage_02_bw_full"]
-    if not (resume and stage02.exists()):
-        logger.info("[Stage 02] Compute BW_full")
-        bw_full = compute_bw_full(bw_amp)
-        np.savez_compressed(stage02, bw_full=bw_full)
-    else:
-        bw_full = _load_npz(stage02)["bw_full"]
-
-    # Stage 03 — QC features + labeling (initialize LabelSet)
-    stage03 = paths["stage_03_qc"]
-    stage03_labels = paths["stage_03_labels"]
-    if not (resume and stage03.exists()):
-        logger.info("[Stage 03] QC features + labeling")
-        df_feat = compute_amp_features(bw_amp, bw_full, wmask)
-        # Derive labels (per-amp summary) for visibility in the parquet
-        df_labels, _good_mask_tmp = label_amps(df_feat)
-        # Merge per-amp label back to rows for visibility
-        df = df_feat.merge(df_labels, on="amp", how="left")
-        write_parquet(df, stage03)
-        # Initialize iterative LabelSet and save snapshot
-        ls = LabelSet.from_features(df_feat)
-        save_labelset(stage03_labels, ls)
-    else:
-        # On resume, build or load LabelSet from existing parquet
-        import pandas as pd  # local import to avoid mandatory dep if unused
-        df = pd.read_parquet(stage03)
-        if stage03_labels.exists():
-            ls = load_labelset(stage03_labels)
-        else:
-            ls = LabelSet.from_features(df)
-            save_labelset(stage03_labels, ls)
-    # Use LabelSet to derive conservative good_mask for subsequent stages
-    good_mask = ls.good_mask()
-
-    # Stage 04 — Build mult_scale
-    stage04 = paths["stage_04_mult"]
-    stage04_labels = paths["stage_04_labels"]
-    if not (resume and stage04.exists()):
-        logger.info("[Stage 04] Build multiplicative mult_scale")
-        mult = build_mult_scale(bw_amp, bw_full, good_mask, wmask, bounds=ms.mult_bounds)
-        np.savez_compressed(stage04, mult_scale=mult)
-    else:
-        mult = _load_npz(stage04)["mult_scale"]
-    # Update labels with mult diagnostics and save snapshot (idempotent on resume)
-    if not stage04_labels.exists():
-        ls.update_with_mult(mult, bounds=ms.mult_bounds)
-        save_labelset(stage04_labels, ls)
-
-    # Stage 04.25 — Fit 2D polynomial model to mult vs. sky position (per exposure)
-    stage0425 = paths["stage_0425_mult_poly2d"]
-    stage0425_labels = paths["stage_0425_labels"]
-    if not (resume and stage0425.exists()):
-        logger.info("[Stage 04.25] Fit 2D polynomial to mult (per exposure)")
-        h5 = H5VIRUS(h5file)
-        poly2d = build_mult_poly2d(
-            h5,
-            mult,
-            degree=3,
-            loss=ms.robust_loss,
-            huber_delta=ms.huber_delta,
-            tukey_c=ms.tukey_c,
-        )
-        np.savez_compressed(
-            stage0425,
-            degree=int(poly2d.degree),
-            coeffs=poly2d.coeffs,
-            ra_amp=poly2d.ra_amp,
-            dec_amp=poly2d.dec_amp,
-            x=poly2d.x,
-            y=poly2d.y,
-            pred=poly2d.pred,
-        )
-        # Update labels with poly2d residuals and save snapshot
-        ls.update_with_poly2d(mult, poly2d.pred)
-        if not stage0425_labels.exists():
-            save_labelset(stage0425_labels, ls)
-    else:
-        # On resume, if labels snapshot missing, load poly2d outputs and update
-        if not stage0425_labels.exists():
-            data0425 = _load_npz(stage0425)
-            if "pred" in data0425:
-                ls.update_with_poly2d(mult, data0425["pred"])
-                save_labelset(stage0425_labels, ls)
-
-    # Stage 04.5 — Fit shared additive polynomial per amp on residual_1
-    stage045 = paths["stage_045_poly"]
-    if not (resume and stage045.exists()):
-        logger.info("[Stage 04.5] Fit shared additive polynomial per amplifier")
-        beta_all = build_amp_poly(
-            bw_amp,
-            bw_full,
-            mult,
-            wmask,
-            order=ms.poly_order,
-            loss=ms.robust_loss,
-            huber_delta=ms.huber_delta,
-            tukey_c=ms.tukey_c,
-        )
-        np.savez_compressed(stage045, poly_beta=beta_all)
-    else:
-        beta_all = _load_npz(stage045)["poly_beta"]
-
-    # Stage 05 — Build PCA basis
-    stage05 = paths["stage_05_pca"]
-    if not (resume and stage05.exists()):
-        logger.info("[Stage 05] Build shot PCA basis")
-        pca = build_shot_pca(
-            bw_amp,
-            bw_full,
-            mult,
-            good_mask,
-            wmask,
-            beta_all,
-            n_components=ms.n_pca,
-            loss=ms.robust_loss,
-            huber_delta=ms.huber_delta,
-            tukey_c=ms.tukey_c,
-        )
-        np.savez_compressed(stage05, **pca)
-    else:
-        pca = _load_npz(stage05)
-
-    # Stage 06 — Per-amp fits (use Stage 04.5 poly + per-exp PCA coeffs)
-    stage06 = paths["stage_06_amp_fits"]
-    if not (resume and stage06.exists()):
-        logger.info("[Stage 06] Fit amplifiers: shared poly + PCA coeffs")
-        df_fits = _fit_all_amps(
-            bw_amp,
-            bw_full,
-            mult,
-            pca,
-            wmask,
-            beta_all,
-            loss=ms.robust_loss,
-            huber_delta=ms.huber_delta,
-            tukey_c=ms.tukey_c,
-        )
-        write_parquet(df_fits, stage06)
-
-    # Stage 07 — Manifest
-    stage07 = paths["stage_07_manifest"]
-    if not (resume and stage07.exists()):
-        logger.info("[Stage 07] Write model-start manifest")
-        manifest = {
-            "inputs": [str(h5file)],
-            "outputs": [
-                str(p)
-                for p in [
-                    stage00,
-                    stage01,
-                    stage02,
-                    stage03,
-                    stage04,
-                    stage0425,
-                    stage045,
-                    stage05,
-                    stage06,
-                    stage07,
-                ]
-            ],
-            "modelspec": ms.to_dict(),
-            "work_dir": str(out.resolve()),
-        }
-        with stage07.open("w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
-    # Optional diagnostics plotting
-    if make_plots:
-        try:
-            from ..plot import plot_bw_amp_vs_full, plot_mult_by_amp, plot_fit_example  # type: ignore
-            plots_dir = out / "plots"
-            plots_dir.mkdir(exist_ok=True)
-            # 1) Multiplicative summary across all amps
-            plot_mult_by_amp(out, highlight_outliers=True, show_labels=True, save=plots_dir / "mult_by_amp.png")
-            # 2) Choose a representative amp (first good, else 0) and exposure 0
-            a_sel = int(np.where(good_mask)[0][0]) if np.any(good_mask) else 0
-            e_sel = 0
-            # 3) Single-amp comparison and fit example
-            plot_bw_amp_vs_full(out, amp=a_sel, exp=e_sel, save=plots_dir / f"bw_amp_vs_full_a{a_sel}_e{e_sel}.png")
-            plot_fit_example(out, amp=a_sel, exp=e_sel, save=plots_dir / f"fit_example_a{a_sel}_e{e_sel}.png")
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Plot generation failed: %s", exc)
+        _run_all()
 
     return {
         "status": "ok",
         "outdir": str(out),
-        "manifest": str(stage07),
+        "manifest": str(paths["Write_Model_Start_Manifest"]),
     }
 
 

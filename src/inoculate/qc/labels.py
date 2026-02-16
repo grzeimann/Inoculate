@@ -223,6 +223,43 @@ def load_labelset(path: str | Path) -> LabelSet:
     return LabelSet.from_dict(d)
 
 
+def discover_latest_snapshot(outdir: str | Path) -> LabelSet | None:
+    """Discover and load the latest label snapshot in outdir.
+
+    Preference order (new semantic keys via ShotPlan, then legacy filenames):
+    - Labels_After_Poly2D
+    - Labels_After_Mult
+    - Initialize_Iterative_Labels
+    - stage_0425_labels.json
+    - stage_04_labels.json
+    - stage_03_labels.json
+    Returns the loaded LabelSet or None if nothing found/loadable.
+    """
+    base = Path(outdir)
+    candidates: list[Path] = []
+    try:
+        from ..shot.plan import ShotPlan  # local import to avoid cyclic at import time
+        sp = ShotPlan(base).paths()
+        for k in ("Labels_After_Poly2D", "Labels_After_Mult", "Initialize_Iterative_Labels",
+                  "stage_0425_labels", "stage_04_labels", "stage_03_labels"):
+            p = sp.get(k)
+            if p is not None:
+                candidates.append(p)
+    except Exception:
+        candidates.extend([
+            base / "stage_0425_labels.json",
+            base / "stage_04_labels.json",
+            base / "stage_03_labels.json",
+        ])
+    for p in candidates:
+        try:
+            if p.exists():
+                return load_labelset(p)
+        except Exception:
+            continue
+    return None
+
+
 # Backward-compatible simple masking API retained
 
 def label_amps(df_features: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray]:

@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="Resume and skip completed stages")
     p.add_argument("--make-plots", action="store_true", help="Generate diagnostic plots into OUTDIR/plots after processing")
     p.add_argument("--max-plots", type=int, default=12, help="Maximum number of plots to generate when --make-plots is set")
+    p.add_argument("--suppress-warnings", action="store_true", help="Suppress runtime warnings (e.g., All-NaN slice) during processing")
     p.add_argument("--amp", type=int, default=0, help="Amplifier index (0-based)")
     p.add_argument("--exp", type=int, default=0, help="Exposure index (0..2)")
     p.add_argument("--show-slice", action="store_true", help="Show the fiber slice for amp/exp and exit")
@@ -51,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     if not path.exists():
         parser.error(f"HDF5 file not found: {path}")
 
-    result = run_shot(str(path), args.outdir, modelspec=None, resume=args.resume, make_plots=args.make_plots, max_plots=args.max_plots)
+    result = run_shot(str(path), args.outdir, modelspec=None, resume=args.resume, make_plots=args.make_plots, max_plots=args.max_plots, suppress_warnings=args.suppress_warnings)
     logger.info("Completed. Manifest: %s", result.get("manifest"))
     return 0
 

@@ -35,6 +35,39 @@ class IFUOptions:
     make_plots: bool = False     # write example IFU diagnostic plots
     max_plots: int = 6           # maximum number of example plots to write
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "wave_mask_frac": float(self.wave_mask_frac),
+            "k_source": float(self.k_source),
+            "make_plots": bool(self.make_plots),
+            "max_plots": int(self.max_plots),
+        }
+
+    def to_json(self) -> str:
+        import json
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "IFUOptions":
+        keys = {"wave_mask_frac", "k_source", "make_plots", "max_plots"}
+        data = {k: d[k] for k in d if k in keys}
+        obj = cls(**data)  # type: ignore[arg-type]
+        obj.validate()
+        return obj
+
+    @classmethod
+    def from_json(cls, s: str) -> "IFUOptions":
+        import json
+        return cls.from_dict(json.loads(s))
+
+    def validate(self) -> None:
+        if not (0.0 < float(self.wave_mask_frac) <= 1.0):
+            raise ValueError("wave_mask_frac must be in (0, 1]")
+        if not (float(self.k_source) > 0):
+            raise ValueError("k_source must be positive")
+        if not (isinstance(self.max_plots, int) and self.max_plots >= 0):
+            raise ValueError("max_plots must be a non-negative integer")
+
 
 def _wave_mask(n_wave: int, frac: float) -> np.ndarray:
     frac = float(np.clip(frac, 0.05, 1.0))
@@ -47,28 +80,12 @@ def _wave_mask(n_wave: int, frac: float) -> np.ndarray:
 
 
 def _latest_labelset(outdir: Path) -> Any | None:
-    # Prefer centralized ShotPlan label paths with graceful fallback
+    """Deprecated internal: delegate to qc.labels.discover_latest_snapshot."""
     try:
-        from ..shot.plan import ShotPlan
-        sp = ShotPlan(outdir).paths()
-        candidates = [
-            sp.get("stage_0425_labels"),
-            sp.get("stage_04_labels"),
-            sp.get("stage_03_labels"),
-        ]
+        from ..qc.labels import discover_latest_snapshot
+        return discover_latest_snapshot(outdir)
     except Exception:
-        candidates = [
-            outdir / "stage_0425_labels.json",
-            outdir / "stage_04_labels.json",
-            outdir / "stage_03_labels.json",
-        ]
-    for c in candidates:
-        if c is not None and c.exists():
-            try:
-                return load_labelset(c)
-            except Exception:
-                continue
-    return None
+        return None
 
 
 def _load_shot_artifacts(outdir: Path) -> Dict[str, np.ndarray]:
@@ -76,9 +93,21 @@ def _load_shot_artifacts(outdir: Path) -> Dict[str, np.ndarray]:
         with np.load(p) as d:  # type: ignore[no-untyped-call]
             return {k: d[k] for k in d.files}
 
-    bw_amp = _load_npz(outdir / "stage_01_bw_amp.npz").get("bw_amp")
-    bw_full = _load_npz(outdir / "stage_02_bw_full.npz").get("bw_full")
-    mult = _load_npz(outdir / "stage_04_mult.npz").get("mult_scale")
+    # Resolve paths via ShotPlan with semantic keys; fall back to legacy if needed
+    try:
+        from ..shot.plan import ShotPlan
+        sp = ShotPlan(outdir).paths()
+        p_bw_amp = sp.get("Build_Amplifier_Robust_Spectra") or sp.get("stage_01_bw_amp")
+        p_bw_full = sp.get("Build_Full_Exposure_Sky") or sp.get("stage_02_bw_full")
+        p_mult = sp.get("Fit_Multiplicative_Scale") or sp.get("stage_04_mult")
+    except Exception:
+        p_bw_amp = outdir / "stage_01_bw_amp.npz"
+        p_bw_full = outdir / "stage_02_bw_full.npz"
+        p_mult = outdir / "stage_04_mult.npz"
+
+    bw_amp = _load_npz(p_bw_amp).get("bw_amp") if p_bw_amp and p_bw_amp.exists() else None
+    bw_full = _load_npz(p_bw_full).get("bw_full") if p_bw_full and p_bw_full.exists() else None
+    mult = _load_npz(p_mult).get("mult_scale") if p_mult and p_mult.exists() else None
     if bw_amp is None or bw_full is None or mult is None:
         raise FileNotFoundError("Required shot artifacts (bw_amp, bw_full, mult) are missing in outdir")
     artifacts: Dict[str, np.ndarray] = {
