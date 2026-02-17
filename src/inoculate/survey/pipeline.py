@@ -21,6 +21,7 @@ import logging
 import numpy as np
 
 from .plan import SurveyPlan
+from ..robust import biweight_location
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +32,31 @@ class SurveyOptions:
 
     Attributes:
         include_partial_ifu: If False, skip IFUs missing any exposure files in a shot.
-        max_shots: Optional limit for development/testing to cap number of shots.
+        max_shots: Optional cap on number of shots (or H5 files) to process.
+        build_from_h5: If True, discover .h5 under shots_root and run per-shot pipelines
+            into survey_root/shots/<shotname>/ before aggregation. If False, treat
+            shots_root as a directory tree of existing shot outdirs (with manifests).
+        shot_resume: Pass through to run_shot(resume=...).
+        ifu_resume: Pass through to run_ifu(resume=...).
+        suppress_warnings: Suppress runtime warnings in run_shot.
     """
 
     include_partial_ifu: bool = True
     max_shots: Optional[int] = None
+    build_from_h5: bool = False
+    shot_resume: bool = True
+    ifu_resume: bool = True
+    suppress_warnings: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"include_partial_ifu": bool(self.include_partial_ifu), "max_shots": self.max_shots}
+        return {
+            "include_partial_ifu": bool(self.include_partial_ifu),
+            "max_shots": self.max_shots,
+            "build_from_h5": bool(self.build_from_h5),
+            "shot_resume": bool(self.shot_resume),
+            "ifu_resume": bool(self.ifu_resume),
+            "suppress_warnings": bool(self.suppress_warnings),
+        }
 
 
 # ---- Stage-like helpers ----
@@ -77,7 +95,7 @@ def _aggregate_ifu_across_shots(shots: List[Path], *, include_partial_ifu: bool 
     """Aggregate per-IFU delta_mult across all provided shots.
 
     For each IFU index, load all available (exp) NPZ files across shots and build:
-      - mean_profile: nanmean over samples of delta_mult[448]
+      - mean_profile: biweight_location over samples of delta_mult[448]
       - mad_profile: 1.4826 * median(|x - median(x)|) per fiber across samples
       - n_samples: number of contributing vectors
       - frac_masked: mean of source_mask across samples per fiber (optional)
@@ -120,9 +138,9 @@ def _aggregate_ifu_across_shots(shots: List[Path], *, include_partial_ifu: bool 
             continue
         # Stack to (n_samples, 448)
         X = np.vstack([a.astype(float) for a in arrs])
-        # Mean profile (nanmean)
+        # Robust mean profile (biweight location) and MAD-based dispersion
         with np.errstate(all="ignore"):
-            mean_profile = np.nanmean(X, axis=0)
+            mean_profile = biweight_location(X, axis=0)
             med = np.nanmedian(X, axis=0, keepdims=True)
             mad_profile = 1.4826 * np.nanmedian(np.abs(X - med), axis=0)
         # Mask fraction
@@ -139,6 +157,84 @@ def _aggregate_ifu_across_shots(shots: List[Path], *, include_partial_ifu: bool 
             "frac_masked": frac_masked.astype(float).tolist(),
         }
     return reg
+
+
+def _write_ifu_profile_plots(shots: List[Path], reg: Dict[int, Dict[str, Any]], plan: SurveyPlan) -> int:
+    """Write per-IFU overlay plots: individual profiles and robust mean.
+
+    Returns the number of plots successfully written. Missing matplotlib is handled
+    gracefully (returns 0).
+    """
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        return 0
+
+    n_written = 0
+    # Build a quick in-memory index of profiles per IFU
+    profiles_by_ifu: Dict[int, List[np.ndarray]] = {}
+    for shot_dir in shots:
+        for ifu, _e, p in _iter_ifu_npz(shot_dir):
+            try:
+                with np.load(p) as d:  # type: ignore[no-untyped-call]
+                    dm = np.array(d.get("delta_mult"), dtype=float)
+            except Exception:
+                continue
+            if dm.ndim != 1:
+                dm = dm.reshape(-1)
+            if dm.size == 0:
+                continue
+            profiles_by_ifu.setdefault(int(ifu), []).append(dm)
+
+    for ifu, entry in reg.items():
+        plot_path = plan.ifu_profiles_plot_path(int(ifu))
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        mean_prof = np.array(entry.get("mean_delta_mult", []), dtype=float)
+        Xs = profiles_by_ifu.get(int(ifu), [])
+        if not Xs and mean_prof.size == 0:
+            continue
+        try:
+            fig, ax = plt.subplots(figsize=(10, 3.0))
+            x = np.arange(mean_prof.size if mean_prof.size else (Xs[0].size if Xs else 448))
+            # Plot individual profiles lightly
+            for y in Xs:
+                if y.size != x.size:
+                    continue
+                ax.plot(x, y, color="#1f77b4", alpha=0.05, lw=0.8)
+            # Overlay robust mean in a stronger color
+            if mean_prof.size == x.size:
+                ax.plot(x, mean_prof, color="tab:red", lw=1.6, label="biweight mean")
+            ax.set_title(f"IFU {int(ifu):03d} — delta_mult profiles across shots")
+            ax.set_xlabel("fiber index (4 amps × 112)")
+            ax.set_ylabel("delta_mult")
+            ax.grid(True, alpha=0.2)
+            if mean_prof.size == x.size:
+                ax.legend(loc="upper right", fontsize=8)
+            # Ensure visible y-range even if constant
+            ydata = []
+            if mean_prof.size:
+                ydata.append(mean_prof)
+            if Xs:
+                ydata.append(np.concatenate([y for y in Xs if y.size == x.size]))
+            if ydata:
+                vals = np.concatenate(ydata)
+                if np.isfinite(vals).any():
+                    vmin = float(np.nanmin(vals))
+                    vmax = float(np.nanmax(vals))
+                    if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+                        pad = 0.05 * (vmax - vmin)
+                        ax.set_ylim(vmin - pad, vmax + pad)
+            ax.set_ylim([0.8, 1.2])
+            fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            n_written += 1
+        except Exception:
+            try:
+                plt.close(fig)  # type: ignore[name-defined]
+            except Exception:
+                pass
+            continue
+    return n_written
 
 
 def run_survey(
@@ -165,10 +261,37 @@ def run_survey(
     plan.ensure_dirs()
     opts = options or SurveyOptions()
 
-    # Discover shots
-    shots = _discover_shot_outdirs(shots_root)
-    if opts.max_shots is not None:
-        shots = shots[: int(opts.max_shots)]
+    # Determine shot outdirs: either discover existing, or build from H5 files
+    shots: List[Path]
+    if opts.build_from_h5:
+        # Build per-shot outputs under survey_root/shots from H5 inputs
+        from .aggregate import find_h5_files
+        from ..shot.pipeline import run_shot
+        from ..ifu.pipeline import run_ifu
+        h5_files = find_h5_files(shots_root)
+        if opts.max_shots is not None:
+            h5_files = h5_files[: int(opts.max_shots)]
+        built_shots: List[Path] = []
+        shots_dir = plan.shots_dir
+        shots_dir.mkdir(parents=True, exist_ok=True)
+        for h5 in h5_files:
+            try:
+                stem = h5.stem
+                out = shots_dir / stem
+                out.mkdir(parents=True, exist_ok=True)
+                # Run shot then IFU
+                run_shot(str(h5), outdir=str(out), resume=bool(opts.shot_resume), make_plots=False, suppress_warnings=bool(opts.suppress_warnings))
+                run_ifu(str(h5), outdir=str(out), resume=bool(opts.ifu_resume))
+                built_shots.append(out)
+            except Exception:
+                logger.exception("Failed processing shot H5: %s", h5)
+                continue
+        shots = built_shots
+    else:
+        # Discover pre-existing shot outputs by manifest
+        shots = _discover_shot_outdirs(shots_root)
+        if opts.max_shots is not None:
+            shots = shots[: int(opts.max_shots)]
 
     # Write shot index
     idx_path = plan.paths()["Shot_Index"]
@@ -185,6 +308,13 @@ def run_survey(
         with dest.open("w", encoding="utf-8") as f:
             json.dump(d, f)
         n_ifu_written += 1
+
+    # Write per-IFU overlay plots (individual profiles + robust mean)
+    try:
+        n_plots = _write_ifu_profile_plots(shots, reg, plan)
+        logger.info("Wrote %d IFU profile plots to %s", int(n_plots), plan.plots_dir)
+    except Exception:
+        logger.warning("Failed to write IFU profile plots", exc_info=True)
 
     # Global survey stats
     stats_path = plan.paths()["Survey_Stats"]

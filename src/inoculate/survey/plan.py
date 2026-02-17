@@ -33,10 +33,20 @@ class SurveyPlan:
     def logs_dir(self) -> Path:
         return Path(self.survey_root) / "logs"
 
+    @property
+    def plots_dir(self) -> Path:
+        """Directory for survey-level plots (e.g., IFU profile overlays)."""
+        return Path(self.survey_root) / "plots"
+
     def ensure_dirs(self) -> None:
         self.registry_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+
+    def ifu_profiles_plot_path(self, ifu: int) -> Path:
+        """Return path for per-IFU overlay plot of individual profiles + mean."""
+        return self.plots_dir / f"ifu{int(ifu):03d}_profiles.png"
 
     def paths(self) -> Dict[str, Path]:
         out = Path(self.survey_root)
@@ -48,7 +58,19 @@ class SurveyPlan:
             "Registry_Dir": self.registry_dir,
             "Cache_Dir": self.cache_dir,
             "Logs_Dir": self.logs_dir,
+            "Shots_Dir": out / "shots",
         }
 
     def ifu_registry_path(self, ifu: int) -> Path:
         return self.registry_dir / f"ifu{int(ifu):03d}_stats.json"
+
+    @property
+    def shots_dir(self) -> Path:
+        return Path(self.survey_root) / "shots"
+
+    def ensure_dirs(self) -> None:
+        # Reorder to ensure shots_dir exists too
+        self.registry_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.shots_dir.mkdir(parents=True, exist_ok=True)
