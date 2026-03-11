@@ -175,9 +175,17 @@ class H5VIRUS:
                 raise SchemaError(f"Failed to access spectral table: {exc}") from exc
 
             try:
-                ifuslots = info.cols.ifuslot[:]
+                ifuslots_raw = info.cols.ifuslot[:]
                 amps_raw = info.cols.amp[:]
-                amps = np.array([a.decode("utf-8") if isinstance(a, (bytes, bytearray)) else str(a) for a in amps_raw])
+                # Normalize to str for both columns
+                ifuslots = np.array([
+                    s.decode("utf-8", errors="ignore") if isinstance(s, (bytes, bytearray)) else str(s)
+                    for s in ifuslots_raw
+                ])
+                amps = np.array([
+                    a.decode("utf-8", errors="ignore") if isinstance(a, (bytes, bytearray)) else str(a)
+                    for a in amps_raw
+                ])
             except Exception as exc:  # pragma: no cover
                 raise SchemaError(f"/Info table is missing required columns (ifuslot, amp): {exc}") from exc
 

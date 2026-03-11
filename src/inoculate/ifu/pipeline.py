@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IFUOptions:
-    wave_mask_frac: float = 0.8  # central fraction of wavelengths to use
+    wave_mask_frac: float = 0.96  # central fraction of wavelengths to use
     k_source: float = 5.0        # MAD threshold for source masking across fibers
     make_plots: bool = False     # write example IFU diagnostic plots
     max_plots: int = 6           # maximum number of example plots to write
@@ -275,8 +275,33 @@ class _IFUStageCompute(_IFUStage):
         else:
             amps_to_do = {int(i) for i in ifu_indices}
 
-        def _ifuslot_for_slice_start(row_index: int) -> str:
+        def _ifuslot_for(a_idx: int, row_index: int) -> str:
+            """Best-effort resolution of IFU slot label for a given amp.
+
+            Preference order:
+            1) Use read_info()["ifuslots"] if it matches n_amp (per-amp) or n_ifu (per-IFU).
+            2) Fallback: read from H5 /Info table by row index corresponding to slice start.
+            3) Final fallback: derive from amp index: ifu = a_idx // 4.
+            """
             try:
+                # Try from info dict first (already normalized to str by H5VIRUS.read_info)
+                slots = np.array(info.get("ifuslots")) if info is not None else None  # type: ignore[arg-type]
+                if slots is not None and slots.size > 0:
+                    n_slots = int(slots.size)
+                    # Ensure string dtype
+                    try:
+                        slots = np.array([
+                            s.decode("utf-8", errors="ignore") if isinstance(s, (bytes, bytearray)) else str(s)
+                            for s in slots.ravel().tolist()
+                        ])
+                    except Exception:
+                        slots = slots.astype(str)
+                    if n_slots == n_amp:
+                        return str(slots[a_idx])
+                    n_ifu = (n_amp + 3) // 4
+                    if n_slots == n_ifu:
+                        return str(slots[a_idx // 4])
+                # Fallback: direct H5 /Info lookup using the start row of the slice
                 h5._require_tables()
                 with h5._open() as fh:  # type: ignore[attr-defined]
                     t = fh.root.Info
@@ -285,7 +310,7 @@ class _IFUStageCompute(_IFUStage):
                         return raw.decode("utf-8", errors="ignore")
                     return str(raw)
             except Exception:
-                return f"amp{row_index // fibers_per_amp // exposures:02d}"
+                return f"ifu{a_idx // 4:03d}"
 
         for a, e, s, arrays in h5.iter_amp_blocks(["spectrum", "skyspectrum"]):
             if a not in amps_to_do:
@@ -351,7 +376,8 @@ class _IFUStageCompute(_IFUStage):
                 else:
                     notes = "GOOD amp: fiber-level deltas computed with source masking (baseline=poly2d if available)"
 
-            ifuslot = _ifuslot_for_slice_start(int(s.start))
+            ifuslot = _ifuslot_for(a, int(s.start))
+            logger.debug("Resolved IFU slot for amp=%d exp=%d: %s", a, e, ifuslot)
             np.savez_compressed(
                 save_path,
                 ifuslot=np.array(ifuslot),
@@ -452,8 +478,47 @@ class _IFUStagePlots(_IFUStage):
             if plots_written >= int(ctx.opts.max_plots):
                 break
             try:
-                plot_path = ifu_plan.ifu_plot_path(ifu_idx)
-                plot_path.parent.mkdir(parents=True, exist_ok=True)
+                # Determine IFU slot string (3 digits) from any available per-IFU NPZ
+                ifuslot_str: Optional[str] = None
+                for e_idx in range(n_exp):
+                    p_meta = ifu_plan.ifu_model_path(ifu_idx, e_idx)
+                    if not p_meta.exists():
+                        continue
+                    try:
+                        with np.load(p_meta) as d:  # type: ignore[no-untyped-call]
+                            amp_ifuslots = d.get("amp_ifuslots", None)
+                            if amp_ifuslots is not None:
+                                # Prefer the first non-empty/finite entry
+                                try:
+                                    slots = [str(s) for s in np.array(amp_ifuslots).ravel().tolist()]
+                                except Exception:
+                                    slots = [str(amp_ifuslots)]
+                                slot_candidate = None
+                                for s in slots:
+                                    if s and s.strip():
+                                        slot_candidate = s.strip()
+                                        break
+                                if slot_candidate:
+                                    # Extract digits and format to 3 digits
+                                    import re
+                                    m = re.search(r"(\d+)", slot_candidate)
+                                    if m:
+                                        try:
+                                            ifuslot_str = f"{int(m.group(1)):03d}"
+                                        except Exception:
+                                            pass
+                                    # if no digits found, leave as None to fallback
+                    except Exception:
+                        pass
+                    if ifuslot_str is not None:
+                        break
+                if ifuslot_str is None:
+                    ifuslot_str = f"{ifu_idx:03d}"
+                # Build plot path using ifuslot string per requirement
+                plot_dir = ifu_plan.plots_dir
+                plot_dir.mkdir(parents=True, exist_ok=True)
+                plot_path = plot_dir / f"ifu{ifuslot_str}_profiles.png"
+
                 fig, ax = plt.subplots(figsize=(10, 3.2))
                 x = np.arange(fibers_per_amp * 4)
                 have_any = False
@@ -470,7 +535,7 @@ class _IFUStagePlots(_IFUStage):
                     ax.plot(x, y, color=colors[e_idx % len(colors)], lw=1.2, alpha=0.9, label=f"exp {e_idx}")
                     if np.any(m):
                         ax.scatter(x[m], y[m], facecolors="none", edgecolors=colors[e_idx % len(colors)], s=12, linewidths=0.8, alpha=0.7)
-                ax.set_title(f"IFU {ifu_idx:03d} — delta_mult per fiber (lines per exposure)")
+                ax.set_title(f"IFUSLOT {ifuslot_str} — delta_mult per fiber (lines per exposure)")
                 ax.set_xlabel("fiber index (4 amps × 112)")
                 ax.set_ylabel("delta_mult")
                 ax.grid(True, alpha=0.2)
@@ -491,6 +556,7 @@ def run_ifu(
     ifu_indices: Optional[Iterable[int]] = None,
     resume: bool = True,
     options: IFUOptions | None = None,
+    suppress_warnings: bool = False,
 ) -> Dict[str, Any]:
     """Run the IFU-level refinement and write per-amplifier outputs.
 
@@ -522,7 +588,16 @@ def run_ifu(
         _IFUStageAggregate(),
         _IFUStagePlots(),
     ]
-    _execute_ifu_stages(stages, ctx, resume=resume)
+
+    import warnings
+    if suppress_warnings:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            warnings.filterwarnings("ignore", category=UserWarning, module=r"astropy\\.stats")
+            warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"astropy\\.stats")
+            _execute_ifu_stages(stages, ctx, resume=resume)
+    else:
+        _execute_ifu_stages(stages, ctx, resume=resume)
 
     # Write a small manifest (unchanged schema)
     manifest = {

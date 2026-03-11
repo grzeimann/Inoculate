@@ -17,4 +17,5 @@ This is an early scaffolding of the package. The science documentation and API w
 
 getting-started/installation
 getting-started/quickstart
+getting-started/survey
 ```

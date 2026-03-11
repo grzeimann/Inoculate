@@ -29,7 +29,7 @@ class ModelSpec:
     poly_order: int = 11
     n_pca: int = 6
     mult_bounds: tuple[float, float] = (0.5, 2.0)
-    wave_mask_frac: float = 0.8
+    wave_mask_frac: float = 0.96
     robust_loss: str = "huber"
     huber_delta: float = 1.0
     tukey_c: float = 4.685

@@ -281,7 +281,7 @@ def run_survey(
                 out.mkdir(parents=True, exist_ok=True)
                 # Run shot then IFU
                 run_shot(str(h5), outdir=str(out), resume=bool(opts.shot_resume), make_plots=False, suppress_warnings=bool(opts.suppress_warnings))
-                run_ifu(str(h5), outdir=str(out), resume=bool(opts.ifu_resume))
+                run_ifu(str(h5), outdir=str(out), resume=bool(opts.ifu_resume), suppress_warnings=bool(opts.suppress_warnings))
                 built_shots.append(out)
             except Exception:
                 logger.exception("Failed processing shot H5: %s", h5)
@@ -299,7 +299,15 @@ def run_survey(
         json.dump({"shots": [str(p) for p in shots]}, f, indent=2)
 
     # Aggregate per-IFU across shots
-    reg = _aggregate_ifu_across_shots(shots, include_partial_ifu=opts.include_partial_ifu)
+    import warnings
+    if opts.suppress_warnings:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            warnings.filterwarnings("ignore", category=UserWarning, module=r"astropy\\.stats")
+            warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"astropy\\.stats")
+            reg = _aggregate_ifu_across_shots(shots, include_partial_ifu=opts.include_partial_ifu)
+    else:
+        reg = _aggregate_ifu_across_shots(shots, include_partial_ifu=opts.include_partial_ifu)
 
     # Persist per-IFU registry entries
     n_ifu_written = 0
@@ -311,7 +319,13 @@ def run_survey(
 
     # Write per-IFU overlay plots (individual profiles + robust mean)
     try:
-        n_plots = _write_ifu_profile_plots(shots, reg, plan)
+        if opts.suppress_warnings:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                warnings.filterwarnings("ignore", category=UserWarning, module=r"matplotlib")
+                n_plots = _write_ifu_profile_plots(shots, reg, plan)
+        else:
+            n_plots = _write_ifu_profile_plots(shots, reg, plan)
         logger.info("Wrote %d IFU profile plots to %s", int(n_plots), plan.plots_dir)
     except Exception:
         logger.warning("Failed to write IFU profile plots", exc_info=True)

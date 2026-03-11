@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     p.add_argument("--make-plots", action="store_true", help="Write example IFU diagnostic plots (delta_mult vs fiber)")
     p.add_argument("--max-plots", type=int, default=6, help="Maximum number of diagnostic plots to write (default: 6)")
+    p.add_argument("--suppress-warnings", action="store_true", help="Suppress runtime warnings during IFU processing")
     return p
 
 
@@ -80,7 +81,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_plots=int(args.max_plots),
     )
 
-    result = run_ifu(str(h5), str(outdir), ifu_indices=ifu_list, resume=bool(args.resume), options=opts)
+    result = run_ifu(str(h5), str(outdir), ifu_indices=ifu_list, resume=bool(args.resume), options=opts, suppress_warnings=bool(args.suppress_warnings))
 
     # Log a concise summary
     n_written = int(result.get("n_written", 0))

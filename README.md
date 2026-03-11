@@ -116,6 +116,61 @@ Notes:
   backward compatibility but the intended multiplicative overview is now provided
   by `plot_mult_by_amp`.
 
+## Survey pipeline at a glance (inoculate-survey)
+
+The diagram below summarizes what happens when you run the survey orchestrator. It mirrors the key logging messages you will see during processing.
+
+Example call:
+```bash
+inoculate-survey /Users/grz85/work/lukas_virus/ --build-from-h5 --max-shots 50 --suppress-warnings
+```
+
+```mermaid
+flowchart TD
+  A[Start: inoculate-survey] --> B{--build-from-h5?}
+  B -- Yes --> C[Discover .h5 under shots_root]
+  B -- No --> D[Discover existing shot outdirs by manifest]
+  C --> E[Run per-shot pipelines into survey output]
+  D --> F[Collect shot outdirs]
+  E --> F
+
+  subgraph Shot-level pipeline 
+    direction TB
+    S0[Validate_Input_Shot_Info]
+    S00[Stage 00: Build wavelength mask]
+    S1[Build_Amplifier_Robust_Spectra]
+    S2[Build_Full_Exposure_Sky]
+    S3[Compute_QC_Features]
+    S4[Fit_Multiplicative_Scale]
+    S425[Fit_Poly2D_Field_Model]
+    S45[Build_Additive_Polynomial]
+    S5[Build_PCA_Components]
+    S6[Write_Amp_Fits]
+    S7[Write_Model_Start_Manifest]
+    S0 --> S00 --> S1 --> S2 --> S3 --> S4 --> S425 --> S45 --> S5 --> S6 --> S7
+  end
+
+  F --> G[Scan per-IFU NPZs: ifu*_e*_fiber_model.npz]
+
+  subgraph IFU modeling 
+    direction TB
+    I1[IFU_Compute_PerAmp_Fiber_Model]
+    I2[IFU_Aggregate_PerIFU]
+    I3[IFU_Write_PerIFU_Plots]
+    I1 --> I2 --> I3
+  end
+
+  G --> H[Aggregate across shots per IFU]
+  H --> I[Compute robust profiles per fiber ]
+  I --> J[Write survey registry: mean_delta_mult, mad_delta_mult, n_samples, frac_masked]
+  J --> K[Done]
+```
+
+Notes
+- When --build-from-h5 is used, each .h5 is processed through the shot and IFU pipelines first; the survey step then aggregates the resulting per-IFU fiber models.
+- Robust statistics: biweight location for central tendency; MAD×1.4826 for dispersion.
+- Outputs are written under the chosen --outdir (default: survey_out).
+
 ## Build the docs (Sphinx + MyST)
 
 ```bash
